@@ -1,0 +1,68 @@
+# github workflow to test xt_NAT_with_netflow_v9 on various vanilla kernels
+name: Kernels Build and Test
+on:
+# manually triggered workflow
+  workflow_dispatch:
+
+#    pull_request:
+#    branches:
+#      - main
+jobs:
+  test-kernels:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel-version: [6.17.8, 6.12.58, 6.6.116, 6.1.158, 5.15.196, 5.10.246, 5.4.301]
+    name: Test with ${{ matrix.kernel-version }}    
+    steps:
+        - name: Checkout repository
+          uses: actions/checkout@v2
+          with:
+            fetch-depth: 0  # Fetch all history for all branches and tags
+            path: xt_NAT_with_netflow_v9
+        - name: Install dependencies
+          run: |
+            sudo apt-get update
+            sudo apt-get install -y flex bison libelf-dev bc libxtables-dev pkg-config dkms libxtables-dev pkg-config
+        - name: Download kernel
+          run: |
+            # if kernel is 6. we use v6.x, otherwise we use v5.x
+            if [[ "${{ matrix.kernel-version }}" == 6.* ]]; then
+              KERNEL_URL="https://cdn.kernel.org/pub/linux/kernel/v6.x";
+            else
+              KERNEL_URL="https://cdn.kernel.org/pub/linux/kernel/v5.x";
+            fi
+            echo "Downloading kernel from $KERNEL_URL"
+            wget $KERNEL_URL/linux-${{ matrix.kernel-version }}.tar.xz
+        - name: Extract kernel source
+          run: |
+            tar -xf linux-${{ matrix.kernel-version }}.tar.xz
+        - name: Configure and build kernel
+          run: |
+            cd linux-${{ matrix.kernel-version }}
+            make tinyconfig
+            ./scripts/config --enable CONFIG_X86_64
+            ./scripts/config --enable CONFIG_NET
+            ./scripts/config --enable CONFIG_INET
+            ./scripts/config --enable CONFIG_IPV6
+            ./scripts/config --enable CONFIG_NETFILTER
+            ./scripts/config --enable CONFIG_BRIDGE
+            ./scripts/config --enable CONFIG_BRIDGE_NETFILTER
+            ./scripts/config --enable CONFIG_NETFILTER_ADVANCED
+            ./scripts/config --enable CONFIG_NF_CONNTRACK
+            ./scripts/config --enable CONFIG_NF_CONNTRACK_EVENTS
+            ./scripts/config --enable CONFIG_MODULES
+            ./scripts/config --enable CONFIG_SYSCTL
+            ./scripts/config --enable CONFIG_PROC_FS
+            ./scripts/config --enable CONFIG_NF_NAT
+            ./scripts/config --enable CONFIG_IP6_NF_IPTABLES
+            make olddefconfig
+            make -j$(nproc)
+            cd ..
+        - name: Build xt_NAT_with_netflow_v9
+          run: |
+            ls -la
+            cd xt_NAT_with_netflow_v9
+            make KDIR=../linux-${{ matrix.kernel-version }}
+
