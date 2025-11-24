@@ -8,7 +8,8 @@ CFLAGS_xt_NAT.o := -DDEBUG
 all: xt_NAT.ko libxt_NAT.so
 
 xt_NAT.ko: xt_NAT.c
-	make -C $(KDIR) M=$(CURDIR) modules CONFIG_DEBUG_INFO=y
+	# To force DWARF/debug info for the module, append CONFIG_DEBUG_INFO=y to this make invocation.
+	make -C $(KDIR) M=$(CURDIR) modules
 	-sync
 
 %_sh.o: libxt_NAT.c
