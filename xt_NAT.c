@@ -190,7 +190,7 @@ static inline u_int32_t pool_table_create(void)
     return 0;
 }
 
-void pool_table_remove(void)
+static void pool_table_remove(void)
 {
     kfree(create_session_lock);
 
@@ -219,7 +219,7 @@ static int users_htable_create(void)
     return 0;
 }
 
-void users_htable_remove(void)
+static void users_htable_remove(void)
 {
     struct user_htable_ent *user;
     struct hlist_head *head;
@@ -245,7 +245,7 @@ void users_htable_remove(void)
     return;
 }
 
-void nat_htable_remove(void)
+static void nat_htable_remove(void)
 {
     struct nat_htable_ent *session;
     struct hlist_head *head;
@@ -319,7 +319,7 @@ static int nat_htable_create(void)
     return 0;
 }
 
-struct nat_htable_ent *lookup_session(struct xt_nat_htable *ht, const uint8_t proto, const u_int32_t addr, const uint16_t port)
+static struct nat_htable_ent *lookup_session(struct xt_nat_htable *ht, const uint8_t proto, const u_int32_t addr, const uint16_t port)
 {
     struct nat_htable_ent *session;
     struct hlist_head *head;
@@ -397,7 +397,7 @@ static int check_user_limits(const u_int8_t proto, const u_int32_t addr)
     return ret;
 }
 
-void update_user_limits(const u_int8_t proto, const u_int32_t addr, const int8_t operation)
+static void update_user_limits(const u_int8_t proto, const u_int32_t addr, const int8_t operation)
 {
     struct user_htable_ent *user;
     struct hlist_head *head;
@@ -457,7 +457,7 @@ void update_user_limits(const u_int8_t proto, const u_int32_t addr, const int8_t
 }
 
 /* socket code */
-static void sk_error_report(struct sock *sk)
+static void nat_sk_error_report(struct sock *sk)
 {
     sk->sk_err = 0;
     return;
@@ -474,7 +474,7 @@ static struct socket *usock_open_sock(const struct sockaddr_storage *addr, void 
     }
     sock->sk->sk_allocation = GFP_ATOMIC;
     sock->sk->sk_prot->unhash(sock->sk); /* hidden from input */
-    sock->sk->sk_error_report = &sk_error_report; /* clear ECONNREFUSED */
+    sock->sk->sk_error_report = &nat_sk_error_report; /* clear ECONNREFUSED */
     sock->sk->sk_user_data = user_data; /* usock */
 
     if (sndbuf < SOCK_MIN_SNDBUF)
@@ -568,7 +568,7 @@ static void netflow_export_flow_v9(const uint8_t proto, const u_int32_t srcaddr,
     spin_unlock_bh(&nfsend_lock);
 }
 
-struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_int32_t useraddr, const uint16_t userport, const u_int32_t dstaddr, const uint16_t dstport, const u_int32_t nataddr)
+static struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_int32_t useraddr, const uint16_t userport, const u_int32_t dstaddr, const uint16_t dstport, const u_int32_t nataddr)
 {
     unsigned int hash;
     struct nat_htable_ent *session, *session2;
@@ -1106,7 +1106,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
     return NF_ACCEPT;
 }
 
-void users_cleanup_timer_callback( struct timer_list *timer )
+static void users_cleanup_timer_callback( struct timer_list *timer )
 {
     struct user_htable_ent *user;
     struct hlist_head *head;
@@ -1153,7 +1153,7 @@ void users_cleanup_timer_callback( struct timer_list *timer )
     spin_unlock_bh(&users_timer_lock);
 }
 
-void sessions_cleanup_timer_callback( struct timer_list *timer )
+static void sessions_cleanup_timer_callback( struct timer_list *timer )
 {
     struct nat_htable_ent *session;
     struct hlist_head *head;
@@ -1220,7 +1220,7 @@ void sessions_cleanup_timer_callback( struct timer_list *timer )
     spin_unlock_bh(&sessions_timer_lock);
 }
 
-void nf_send_timer_callback( struct timer_list *timer )
+static void nf_send_timer_callback( struct timer_list *timer )
 {
     spin_lock_bh(&nfsend_lock);
     netflow_export_pdu_v9();
@@ -1484,9 +1484,9 @@ static void __exit nat_tg_exit(void)
     spin_lock_bh(&sessions_timer_lock);
     spin_lock_bh(&users_timer_lock);
     spin_lock_bh(&nfsend_lock);
-    del_timer( &sessions_cleanup_timer );
-    del_timer( &users_cleanup_timer );
-    del_timer( &nf_send_timer );
+    compat_del_timer_sync( &sessions_cleanup_timer );
+    compat_del_timer_sync( &users_cleanup_timer );
+    compat_del_timer_sync( &nf_send_timer );
 
     remove_proc_entry( "sessions", proc_net_nat );
     remove_proc_entry( "users", proc_net_nat );
@@ -1522,4 +1522,3 @@ MODULE_DESCRIPTION("Xtables: Full Cone NAT");
 MODULE_AUTHOR("Andrei Sharaev <andr.sharaev@gmail.com>");
 MODULE_LICENSE("GPL");
 MODULE_ALIAS("ipt_NAT");
-
