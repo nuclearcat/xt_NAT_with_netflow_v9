@@ -18,6 +18,15 @@ address and port to any external IP address and port
 * NAT events export using **Netflow v9**
 * NAT statistics via /proc interface
 
+## Limitations
+* IPv4-only target (no IPv6 support).
+* IPv4 packets with IP options are dropped (IP header length must be 20 bytes).
+* IPv4 fragments with non-zero offset are dropped by the target. Only the first fragment can pass.
+* Locally generated ICMP errors (for example "Fragmentation Needed" for PMTUD) are not translated by xt_NAT.
+* If you disable hardware offloads (GRO/GSO/TSO) you are more likely to see real IP fragments; those will be dropped.
+* No ALGs/helpers (FTP/SIP/PPTP/etc.) are implemented.
+* For non-TCP/UDP/ICMP protocols, mapping is per-user+proto (port=0), so distinct flows of the same protocol are not separated.
+
 ## Installation
 ```
 $ make
