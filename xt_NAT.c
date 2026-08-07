@@ -762,6 +762,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
     struct nat_htable_ent *session;
     uint32_t nat_addr;
     uint16_t nat_port;
+    unsigned int inner_hlen;
     skb_frag_t *frag;
     const struct xt_nat_tginfo *info = par->targinfo;
 
@@ -1055,12 +1056,24 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 ip = (struct iphdr *)skb_network_header(skb);
                 skb_reset_network_header(skb);
 
+                /* The quoted header carries its own length, and the transport
+                 * header below is located with ip->ihl * 4 - but the length
+                 * checks only ever validated sizeof(struct iphdr) of it. An
+                 * ICMP error quoting a packet that carried IP options then
+                 * read, and wrote, up to 40 bytes past the validated area.
+                 */
+                inner_hlen = ip->ihl * 4;
+                if (ip->ihl < 5) {
+                    printk(KERN_DEBUG "xt_NAT DNAT: Drop related ICMP packet witch bad IP header\n");
+                    return NF_DROP;
+                }
+
                 if (ip->protocol == IPPROTO_TCP) {
-                    if (skb->len < ip_hdrlen(skb) + sizeof(struct icmphdr) + sizeof(struct iphdr) + 8) {
+                    if (skb->len < sizeof(struct iphdr) + sizeof(struct icmphdr) + inner_hlen + 8) {
                         printk(KERN_DEBUG "xt_NAT DNAT: Drop related ICMP packet witch truncated TCP header\n");
                         return NF_DROP;
                     }
-                    skb_set_transport_header(skb, (ip->ihl * 4) + sizeof(struct icmphdr) + sizeof(struct iphdr));
+                    skb_set_transport_header(skb, sizeof(struct iphdr) + sizeof(struct icmphdr) + inner_hlen);
                     tcp = (struct tcphdr *)skb_transport_header(skb);
                     skb_reset_transport_header(skb);
                     rcu_read_lock_bh();
@@ -1079,12 +1092,12 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                     ip->daddr = session->data->in_addr;
                     rcu_read_unlock_bh();
                 } else if (ip->protocol == IPPROTO_UDP) {
-                    if (skb->len < ip_hdrlen(skb) + sizeof(struct icmphdr) + sizeof(struct iphdr) + 8) {
+                    if (skb->len < sizeof(struct iphdr) + sizeof(struct icmphdr) + inner_hlen + 8) {
                         printk(KERN_DEBUG "xt_NAT DNAT: Drop related ICMP packet witch truncated UDP header\n");
                         return NF_DROP;
                     }
 
-                    skb_set_transport_header(skb, (ip->ihl * 4) + sizeof(struct icmphdr) + sizeof(struct iphdr));
+                    skb_set_transport_header(skb, sizeof(struct iphdr) + sizeof(struct icmphdr) + inner_hlen);
                     udp = (struct udphdr *)skb_transport_header(skb);
                     skb_reset_transport_header(skb);
                     rcu_read_lock_bh();
@@ -1103,12 +1116,12 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                     ip->daddr = session->data->in_addr;
                     rcu_read_unlock_bh();
                 } else if (ip->protocol == IPPROTO_ICMP) {
-                    if (skb->len < ip_hdrlen(skb) + sizeof(struct icmphdr) + sizeof(struct iphdr) + 8) {
+                    if (skb->len < sizeof(struct iphdr) + sizeof(struct icmphdr) + inner_hlen + 8) {
                         printk(KERN_DEBUG "xt_NAT DNAT: Drop related ICMP packet witch truncated ICMP header\n");
                         return NF_DROP;
                     }
 
-                    skb_set_transport_header(skb, (ip->ihl * 4) + sizeof(struct icmphdr) + sizeof(struct iphdr));
+                    skb_set_transport_header(skb, sizeof(struct iphdr) + sizeof(struct icmphdr) + inner_hlen);
                     icmp = (struct icmphdr *)skb_transport_header(skb);
                     skb_reset_transport_header(skb);
 
