@@ -226,6 +226,9 @@ static void users_htable_remove(void)
     struct hlist_node *next;
     int i;
 
+    if (ht_users == NULL)
+        return;
+
     for (i = 0; i < users_hash_size; i++) {
         spin_lock_bh(&ht_users[i].lock);
         head = &ht_users[i].user;
@@ -241,6 +244,7 @@ static void users_htable_remove(void)
         spin_unlock_bh(&ht_users[i].lock);
     }
     kfree(ht_users);
+    ht_users = NULL;
     printk(KERN_INFO "xt_NAT users_htable_remove DONE\n");
     return;
 }
@@ -252,6 +256,14 @@ static void nat_htable_remove(void)
     struct hlist_node *next;
     unsigned int i;
     void *p;
+
+    if (ht_inner == NULL || ht_outer == NULL) {
+        kfree(ht_inner);
+        kfree(ht_outer);
+        ht_inner = NULL;
+        ht_outer = NULL;
+        return;
+    }
 
     for (i = 0; i < nat_hash_size; i++) {
         spin_lock_bh(&ht_inner[i].lock);
@@ -282,6 +294,12 @@ static void nat_htable_remove(void)
         }
         spin_unlock_bh(&ht_outer[i].lock);
     }
+
+    kfree(ht_inner);
+    kfree(ht_outer);
+    ht_inner = NULL;
+    ht_outer = NULL;
+
     printk(KERN_INFO "xt_NAT nat_htable_remove DONE\n");
     return;
 }
