@@ -764,7 +764,6 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
     uint16_t nat_port;
     unsigned int inner_hlen;
     unsigned int icmp_off;
-    skb_frag_t *frag;
     const struct xt_nat_tginfo *info = par->targinfo;
 
     if (unlikely(skb->protocol != htons(ETH_P_IP))) {
@@ -980,20 +979,6 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             tcp = (struct tcphdr *)skb_transport_header(skb);
             skb_reset_transport_header(skb);
 
-            if (unlikely(skb_shinfo(skb)->nr_frags > 1 && skb_headlen(skb) == sizeof(struct iphdr))) {
-                frag = &skb_shinfo(skb)->frags[0];
-                if (unlikely(skb_frag_size(frag) < sizeof(struct tcphdr))) {
-                        printk(KERN_DEBUG "xt_NAT DNAT: drop TCP frag_size = %d\n", skb_frag_size(frag));
-                        return NF_DROP;
-                }
-                tcp = (struct tcphdr *)skb_frag_address_safe(frag);
-                if (unlikely(tcp == NULL)) {
-                        printk(KERN_DEBUG "xt_NAT DNAT: drop fragmented TCP\n");
-                        return NF_DROP;
-                }
-                atomic64_inc(&frags);
-            }
-
             rcu_read_lock_bh();
             session = lookup_session(ht_outer, ip->protocol, ip->daddr, tcp->dest);
             if (likely(session)) {
@@ -1033,20 +1018,6 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 
             skb_set_transport_header(skb, ip->ihl * 4);
             udp = (struct udphdr *)skb_transport_header(skb);
-
-            if (unlikely(skb_shinfo(skb)->nr_frags > 1 && skb_headlen(skb) == sizeof(struct iphdr))) {
-                frag = &skb_shinfo(skb)->frags[0];
-                if (unlikely(skb_frag_size(frag) < sizeof(struct udphdr))) {
-                        printk(KERN_DEBUG "xt_NAT DNAT: drop UDP frag_size = %d\n", skb_frag_size(frag));
-                        return NF_DROP;
-                }
-                udp = (struct udphdr *)skb_frag_address_safe(frag);
-                if (unlikely(udp == NULL)) {
-                        printk(KERN_DEBUG "xt_NAT DNAT: drop fragmented UDP\n");
-                        return NF_DROP;
-                }
-                atomic64_inc(&frags);
-            }
 
             rcu_read_lock_bh();
             session = lookup_session(ht_outer, ip->protocol, ip->daddr, udp->dest);
