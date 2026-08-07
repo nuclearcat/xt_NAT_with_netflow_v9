@@ -177,7 +177,7 @@ get_hash_user_ent(const u_int32_t addr)
     return reciprocal_scale(jhash_1word(addr, 0), users_hash_size);
 }
 
-static inline u_int32_t pool_table_create(void)
+static int pool_table_create(void)
 {
     unsigned int sz; /* (bytes) */
     unsigned int pool_size;
@@ -203,6 +203,7 @@ static inline u_int32_t pool_table_create(void)
 static void pool_table_remove(void)
 {
     kfree(create_session_lock);
+    create_session_lock = NULL;
 
     printk(KERN_INFO "xt_NAT pool_table_remove DEBUG: removed\n");
 }
@@ -334,8 +335,11 @@ static int nat_htable_create(void)
     printk(KERN_INFO "xt_NAT DEBUG: sessions htable inner mem: %d\n", sz);
 
     ht_outer = kzalloc(sz, GFP_KERNEL);
-    if (ht_outer == NULL)
+    if (ht_outer == NULL) {
+        kfree(ht_inner);
+        ht_inner = NULL;
         return -ENOMEM;
+    }
 
     for (i = 0; i < nat_hash_size; i++) {
         spin_lock_init(&ht_outer[i].lock);
@@ -1451,6 +1455,32 @@ static int add_nf_destinations(const char *ptr)
     return 0;
 }
 
+static void nf_destinations_remove(void)
+{
+    while (!list_empty(&usock_list)) {
+        struct netflow_sock *usock;
+
+        usock = list_entry(usock_list.next, struct netflow_sock, list);
+        list_del(&usock->list);
+        if (usock->sock)
+            sock_release(usock->sock);
+        usock->sock = NULL;
+        vfree(usock);
+    }
+}
+
+static void nat_proc_remove(void)
+{
+    if (!proc_net_nat)
+        return;
+
+    remove_proc_entry( "sessions", proc_net_nat );
+    remove_proc_entry( "users", proc_net_nat );
+    remove_proc_entry( "statistics", proc_net_nat );
+    proc_remove(proc_net_nat);
+    proc_net_nat = NULL;
+}
+
 static struct xt_target nat_tg_reg __read_mostly = {
     .name     = "NAT",
     .revision = 0,
@@ -1464,7 +1494,7 @@ static struct xt_target nat_tg_reg __read_mostly = {
 static int __init nat_tg_init(void)
 {
     char buff[128] = { 0 };
-    int i, j;
+    int i, j, ret;
 
     printk(KERN_INFO "Module xt_NAT loaded\n");
 
@@ -1503,26 +1533,57 @@ static int __init nat_tg_init(void)
         printk(KERN_INFO "xt_NAT DEBUG: IP Pool from %pI4 to %pI4\n", &nat_pool_start, &nat_pool_end);
     } else {
         printk(KERN_INFO "xt_NAT DEBUG: BAD IP Pool from %pI4 to %pI4\n", &nat_pool_start, &nat_pool_end);
-        return -1;
+        return -EINVAL;
     }
 
     printk(KERN_INFO "xt_NAT DEBUG: NAT hash size: %d\n", nat_hash_size);
     printk(KERN_INFO "xt_NAT DEBUG: Users hash size: %d\n", users_hash_size);
 
-    nat_htable_create();
-    users_htable_create();
-    pool_table_create();
+    ret = nat_htable_create();
+    if (ret < 0)
+        goto err_tables;
 
-    add_nf_destinations(nf_dest);
+    ret = users_htable_create();
+    if (ret < 0)
+        goto err_tables;
+
+    ret = pool_table_create();
+    if (ret < 0)
+        goto err_tables;
+
+    ret = add_nf_destinations(nf_dest);
+    if (ret < 0)
+        goto err_nf_dest;
 
     proc_net_nat = proc_mkdir("NAT",init_net.proc_net);
+    if (!proc_net_nat) {
+        printk(KERN_ERR "xt_NAT ERROR: cannot create /proc/net/NAT\n");
+        ret = -ENOMEM;
+        goto err_nf_dest;
+    }
     proc_create("sessions", 0644, proc_net_nat, &nat_seq_fops);
     proc_create("users", 0644, proc_net_nat, &users_seq_fops);
     proc_create("statistics", 0644, proc_net_nat, &stat_seq_fops);
 
     nat_timers_setup();
 
-    return xt_register_target(&nat_tg_reg);
+    ret = xt_register_target(&nat_tg_reg);
+    if (ret < 0)
+        goto err_register;
+
+    return 0;
+
+err_register:
+    nat_timers_stop();
+    nat_proc_remove();
+err_nf_dest:
+    nf_destinations_remove();
+err_tables:
+    pool_table_remove();
+    users_htable_remove();
+    nat_htable_remove();
+    printk(KERN_ERR "xt_NAT ERROR: module load failed, error %d\n", ret);
+    return ret;
 }
 
 static void __exit nat_tg_exit(void)
@@ -1531,25 +1592,13 @@ static void __exit nat_tg_exit(void)
 
     nat_timers_stop();
 
-    remove_proc_entry( "sessions", proc_net_nat );
-    remove_proc_entry( "users", proc_net_nat );
-    remove_proc_entry( "statistics", proc_net_nat );
-    proc_remove(proc_net_nat);
+    nat_proc_remove();
 
     pool_table_remove();
     users_htable_remove();
     nat_htable_remove();
 
-    while (!list_empty(&usock_list)) {
-        struct netflow_sock *usock;
-
-        usock = list_entry(usock_list.next, struct netflow_sock, list);
-        list_del(&usock->list);
-        if (usock->sock)
-            sock_release(usock->sock);
-        usock->sock = NULL;
-        vfree(usock);
-    }
+    nf_destinations_remove();
 
     printk(KERN_INFO "Module xt_NAT unloaded\n");
 }
