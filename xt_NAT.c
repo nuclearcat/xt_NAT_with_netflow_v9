@@ -1439,7 +1439,6 @@ static int __init nat_tg_init(void)
 
     if (nat_pool_start && nat_pool_end && nat_pool_start <= nat_pool_end ) {
         printk(KERN_INFO "xt_NAT DEBUG: IP Pool from %pI4 to %pI4\n", &nat_pool_start, &nat_pool_end);
-        pool_table_create();
     } else {
         printk(KERN_INFO "xt_NAT DEBUG: BAD IP Pool from %pI4 to %pI4\n", &nat_pool_start, &nat_pool_end);
         return -1;
