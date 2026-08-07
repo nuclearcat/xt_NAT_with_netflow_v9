@@ -86,7 +86,7 @@ struct netflow_sock {
 };
 
 struct xt_nat_htable {
-    uint8_t use;
+    uint32_t use;
     spinlock_t lock;
     struct hlist_head session;
 };
@@ -125,7 +125,7 @@ static inline void nat_session_put(struct nat_session *data)
 }
 
 struct xt_users_htable {
-    uint8_t use;
+    uint32_t use;
     spinlock_t lock;
     struct hlist_head user;
 };
@@ -265,7 +265,7 @@ static void users_htable_remove(void)
         }
 
         if (ht_users[i].use != 0) {
-            printk(KERN_WARNING "xt_NAT users_htable_remove ERROR: bad use value: %d in element %d\n", ht_users[i].use, i);
+            printk(KERN_WARNING "xt_NAT users_htable_remove ERROR: bad use value: %u in element %d\n", ht_users[i].use, i);
         }
         spin_unlock_bh(&ht_users[i].lock);
     }
@@ -302,7 +302,7 @@ static void nat_htable_remove(void)
             nat_session_put(data);
         }
         if (ht_inner[i].use != 0) {
-            printk(KERN_WARNING "xt_NAT nat_htable_remove inner ERROR: bad use value: %d in element %d\n", ht_inner[i].use, i);
+            printk(KERN_WARNING "xt_NAT nat_htable_remove inner ERROR: bad use value: %u in element %d\n", ht_inner[i].use, i);
         }
         spin_unlock_bh(&ht_inner[i].lock);
     }
@@ -318,7 +318,7 @@ static void nat_htable_remove(void)
             nat_session_put(data);
         }
         if (ht_outer[i].use != 0) {
-            printk(KERN_WARNING "xt_NAT nat_htable_remove outer ERROR: bad use value: %d in element %d\n", ht_outer[i].use, i);
+            printk(KERN_WARNING "xt_NAT nat_htable_remove outer ERROR: bad use value: %u in element %d\n", ht_outer[i].use, i);
         }
         spin_unlock_bh(&ht_outer[i].lock);
     }
@@ -375,9 +375,6 @@ static struct nat_htable_ent *lookup_session(struct xt_nat_htable *ht, const uin
     unsigned int hash;
 
     hash = get_hash_nat_ent(proto, addr, port);
-    if (ht[hash].use == 0)
-        return NULL;
-
     head = &ht[hash].session;
     hlist_for_each_entry_rcu(session, head, list_node) {
         if (session->addr == addr && session->port == port && session->proto == proto && session->data->timeout > 0) {
