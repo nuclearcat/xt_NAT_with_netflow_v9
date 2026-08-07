@@ -619,11 +619,17 @@ static struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_in
     nataddr_id = ntohl(nataddr) - ntohl(nat_pool_start);
     spin_lock_bh(&create_session_lock[nataddr_id]);
 
+    /* Contract with the caller: either NULL with no RCU read lock held, or a
+     * session with rcu_read_lock_bh() held for it to drop.
+     */
     rcu_read_lock_bh();
     session = lookup_session(ht_inner, proto, useraddr, userport);
     if(unlikely(session)) {
         spin_unlock_bh(&create_session_lock[nataddr_id]);
-        return lookup_session(ht_outer, proto, nataddr, session->data->out_port);
+        session = lookup_session(ht_outer, proto, nataddr, session->data->out_port);
+        if (unlikely(session == NULL))
+            rcu_read_unlock_bh();
+        return session;
     }
     rcu_read_unlock_bh();
 
@@ -709,7 +715,10 @@ static struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_in
     atomic64_inc(&sessions_created);
     atomic64_inc(&sessions_active);
     rcu_read_lock_bh();
-    return lookup_session(ht_outer, proto, nataddr, natport);
+    session = lookup_session(ht_outer, proto, nataddr, natport);
+    if (unlikely(session == NULL))
+        rcu_read_unlock_bh();
+    return session;
 }
 
 static unsigned int
