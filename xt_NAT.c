@@ -12,6 +12,7 @@
 #include <linux/netfilter/x_tables.h>
 #include <linux/inet.h>
 #include <linux/proc_fs.h>
+#include <linux/refcount.h>
 #include <net/tcp.h>
 #include "compat.h"
 #include "xt_NAT.h"
@@ -99,7 +100,15 @@ struct nat_htable_ent {
     struct nat_session *data;
 };
 
+/* One nat_session is shared by the two nat_htable_ent that point at it, one
+ * in ht_inner and one in ht_outer. They live in unrelated buckets and are
+ * unlinked independently by the GC, so the session is refcounted and freed
+ * once the second entry is gone - deferred, because RCU readers may still be
+ * walking either chain.
+ */
 struct nat_session {
+    struct rcu_head rcu;
+    refcount_t refcnt;
     uint32_t in_addr;
     uint32_t dst_addr;
     uint16_t dst_port;
@@ -108,6 +117,12 @@ struct nat_session {
     int16_t  timeout;
     uint8_t  flags;
 };
+
+static inline void nat_session_put(struct nat_session *data)
+{
+    if (refcount_dec_and_test(&data->refcnt))
+        kfree_rcu(data, rcu);
+}
 
 struct xt_users_htable {
     uint8_t use;
@@ -265,8 +280,8 @@ static void nat_htable_remove(void)
     struct nat_htable_ent *session;
     struct hlist_head *head;
     struct hlist_node *next;
+    struct nat_session *data;
     unsigned int i;
-    void *p;
 
     if (ht_inner == NULL || ht_outer == NULL) {
         kfree(ht_inner);
@@ -280,9 +295,11 @@ static void nat_htable_remove(void)
         spin_lock_bh(&ht_inner[i].lock);
         head = &ht_inner[i].session;
         hlist_for_each_entry_safe(session, next, head, list_node) {
+            data = session->data;
             hlist_del_rcu(&session->list_node);
             ht_inner[i].use--;
             kfree_rcu(session, rcu);
+            nat_session_put(data);
         }
         if (ht_inner[i].use != 0) {
             printk(KERN_WARNING "xt_NAT nat_htable_remove inner ERROR: bad use value: %d in element %d\n", ht_inner[i].use, i);
@@ -294,11 +311,11 @@ static void nat_htable_remove(void)
         spin_lock_bh(&ht_outer[i].lock);
         head = &ht_outer[i].session;
         hlist_for_each_entry_safe(session, next, head, list_node) {
+            data = session->data;
             hlist_del_rcu(&session->list_node);
             ht_outer[i].use--;
-            p = session->data;
             kfree_rcu(session, rcu);
-            kfree(p);
+            nat_session_put(data);
         }
         if (ht_outer[i].use != 0) {
             printk(KERN_WARNING "xt_NAT nat_htable_remove outer ERROR: bad use value: %d in element %d\n", ht_outer[i].use, i);
@@ -675,6 +692,9 @@ static struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_in
         spin_unlock_bh(&create_session_lock[nataddr_id]);
         return NULL;
     }
+
+    /* one reference for the ht_inner entry, one for the ht_outer entry */
+    refcount_set(&data_session->refcnt, 2);
 
     data_session->in_addr = useraddr;
     data_session->in_port = userport;
@@ -1200,8 +1220,10 @@ static void sessions_cleanup_timer_callback( struct timer_list *timer )
     struct nat_htable_ent *session;
     struct hlist_head *head;
     struct hlist_node *next;
+    struct nat_session *data;
     unsigned int i;
-    void *p;
+    uint8_t proto;
+    u_int32_t addr;
     u_int32_t vector_start, vector_end;
 
     spin_lock_bh(&sessions_timer_lock);
@@ -1230,10 +1252,16 @@ static void sessions_cleanup_timer_callback( struct timer_list *timer )
                 if (session->data->timeout == 0) {
                     netflow_export_flow_v9(session->proto, session->addr, session->port, session->data->dst_addr, session->data->dst_port, get_nat_addr(session->addr), session->data->out_port, 2);
                 } else if (session->data->timeout <= -10) {
+                    /* save what we need: after kfree_rcu() the entry is dead */
+                    data  = session->data;
+                    proto = session->proto;
+                    addr  = session->addr;
+
                     hlist_del_rcu(&session->list_node);
                     ht_inner[i].use--;
                     kfree_rcu(session, rcu);
-                    update_user_limits(session->proto, session->addr, -1);
+                    nat_session_put(data);
+                    update_user_limits(proto, addr, -1);
                 }
             }
         }
@@ -1246,11 +1274,11 @@ static void sessions_cleanup_timer_callback( struct timer_list *timer )
             head = &ht_outer[i].session;
             hlist_for_each_entry_safe(session, next, head, list_node) {
                 if (session->data->timeout <= -10) {
+                    data = session->data;
                     hlist_del_rcu(&session->list_node);
                     ht_outer[i].use--;
-                    p = session->data;
                     kfree_rcu(session, rcu);
-                    kfree(p);
+                    nat_session_put(data);
                     atomic64_dec(&sessions_active);
                 }
             }
