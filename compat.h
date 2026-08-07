@@ -19,4 +19,14 @@
 # define compat_del_timer(t) del_timer(t)
 #endif
 
+/* skb_make_writable() was replaced by skb_ensure_writable() in 5.2
+ * (36976d70b426 "net: remove skb_make_writable"). The old one returns
+ * true on success, the new one 0.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,2,0)
+# define compat_skb_ensure_writable(s, l) skb_ensure_writable(s, l)
+#else
+# define compat_skb_ensure_writable(s, l) (skb_make_writable(s, l) ? 0 : -ENOMEM)
+#endif
+
 #endif /* COMPAT_NAT_H */

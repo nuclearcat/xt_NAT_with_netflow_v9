@@ -795,6 +795,11 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 printk(KERN_DEBUG "xt_NAT SNAT: Drop truncated TCP packet\n");
                 return NF_DROP;
             }
+            if (unlikely(compat_skb_ensure_writable(skb, ip_hdrlen(skb) + sizeof(struct tcphdr)))) {
+                printk(KERN_DEBUG "xt_NAT SNAT: Drop unwritable TCP packet\n");
+                return NF_DROP;
+            }
+            ip = (struct iphdr *)skb_network_header(skb);
             skb_set_transport_header(skb, ip->ihl * 4);
             tcp = (struct tcphdr *)skb_transport_header(skb);
             skb_reset_transport_header(skb);
@@ -842,6 +847,11 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 printk(KERN_DEBUG "xt_NAT SNAT: Drop truncated UDP packet\n");
                 return NF_DROP;
             }
+            if (unlikely(compat_skb_ensure_writable(skb, ip_hdrlen(skb) + sizeof(struct udphdr)))) {
+                printk(KERN_DEBUG "xt_NAT SNAT: Drop unwritable UDP packet\n");
+                return NF_DROP;
+            }
+            ip = (struct iphdr *)skb_network_header(skb);
 
             skb_set_transport_header(skb, ip->ihl * 4);
             udp = (struct udphdr *)skb_transport_header(skb);
@@ -883,6 +893,11 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 printk(KERN_DEBUG "xt_NAT SNAT: Drop truncated ICMP packet\n");
                 return NF_DROP;
             }
+            if (unlikely(compat_skb_ensure_writable(skb, ip_hdrlen(skb) + sizeof(struct icmphdr)))) {
+                printk(KERN_DEBUG "xt_NAT SNAT: Drop unwritable ICMP packet\n");
+                return NF_DROP;
+            }
+            ip = (struct iphdr *)skb_network_header(skb);
 
             skb_set_transport_header(skb, ip->ihl * 4);
             icmp = (struct icmphdr *)skb_transport_header(skb);
@@ -920,6 +935,12 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 rcu_read_unlock_bh();
             }
         } else {
+            if (unlikely(compat_skb_ensure_writable(skb, ip_hdrlen(skb)))) {
+                printk(KERN_DEBUG "xt_NAT SNAT: Drop unwritable packet\n");
+                return NF_DROP;
+            }
+            ip = (struct iphdr *)skb_network_header(skb);
+
             rcu_read_lock_bh();
             session = lookup_session(ht_inner, ip->protocol, ip->saddr, 0);
             if (session) {
@@ -948,6 +969,13 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 printk(KERN_DEBUG "xt_NAT DNAT: Drop truncated TCP packet\n");
                 return NF_DROP;
             }
+            if (unlikely(skb_headlen(skb) < ip_hdrlen(skb) + sizeof(struct tcphdr)))
+                atomic64_inc(&frags);
+            if (unlikely(compat_skb_ensure_writable(skb, ip_hdrlen(skb) + sizeof(struct tcphdr)))) {
+                printk(KERN_DEBUG "xt_NAT DNAT: Drop unwritable TCP packet\n");
+                return NF_DROP;
+            }
+            ip = (struct iphdr *)skb_network_header(skb);
             skb_set_transport_header(skb, ip->ihl * 4);
             tcp = (struct tcphdr *)skb_transport_header(skb);
             skb_reset_transport_header(skb);
@@ -995,6 +1023,13 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 printk(KERN_DEBUG "xt_NAT DNAT: Drop truncated UDP packet\n");
                 return NF_DROP;
             }
+            if (unlikely(skb_headlen(skb) < ip_hdrlen(skb) + sizeof(struct udphdr)))
+                atomic64_inc(&frags);
+            if (unlikely(compat_skb_ensure_writable(skb, ip_hdrlen(skb) + sizeof(struct udphdr)))) {
+                printk(KERN_DEBUG "xt_NAT DNAT: Drop unwritable UDP packet\n");
+                return NF_DROP;
+            }
+            ip = (struct iphdr *)skb_network_header(skb);
 
             skb_set_transport_header(skb, ip->ihl * 4);
             udp = (struct udphdr *)skb_transport_header(skb);
@@ -1039,6 +1074,11 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 printk(KERN_DEBUG "xt_NAT DNAT: Drop truncated ICMP packet\n");
                 return NF_DROP;
             }
+            if (unlikely(compat_skb_ensure_writable(skb, ip_hdrlen(skb) + sizeof(struct icmphdr)))) {
+                printk(KERN_DEBUG "xt_NAT DNAT: Drop unwritable ICMP packet\n");
+                return NF_DROP;
+            }
+            ip = (struct iphdr *)skb_network_header(skb);
 
             skb_set_transport_header(skb, ip->ihl * 4);
             icmp = (struct icmphdr *)skb_transport_header(skb);
@@ -1050,6 +1090,11 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 atomic64_inc(&related_icmp);
                 if (skb->len < ip_hdrlen(skb) + sizeof(struct icmphdr) + sizeof(struct iphdr)) {
                     printk(KERN_DEBUG "xt_NAT DNAT: Drop related ICMP packet witch truncated IP header\n");
+                    return NF_DROP;
+                }
+
+                if (unlikely(compat_skb_ensure_writable(skb, sizeof(struct iphdr) + sizeof(struct icmphdr) + sizeof(struct iphdr)))) {
+                    printk(KERN_DEBUG "xt_NAT DNAT: Drop unwritable related ICMP packet\n");
                     return NF_DROP;
                 }
 
@@ -1069,11 +1114,24 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                     return NF_DROP;
                 }
 
+                /* All three embedded protocols below need the quoted header
+                 * plus its first 8 transport bytes, and all three write into
+                 * them.
+                 */
+                if (skb->len < sizeof(struct iphdr) + sizeof(struct icmphdr) + inner_hlen + 8) {
+                    printk(KERN_DEBUG "xt_NAT DNAT: Drop related ICMP packet witch truncated header\n");
+                    return NF_DROP;
+                }
+                if (unlikely(compat_skb_ensure_writable(skb, sizeof(struct iphdr) + sizeof(struct icmphdr) + inner_hlen + 8))) {
+                    printk(KERN_DEBUG "xt_NAT DNAT: Drop unwritable related ICMP packet\n");
+                    return NF_DROP;
+                }
+                /* the pull above may have moved the data */
+                skb_set_network_header(skb,sizeof(struct icmphdr) + sizeof(struct iphdr));
+                ip = (struct iphdr *)skb_network_header(skb);
+                skb_reset_network_header(skb);
+
                 if (ip->protocol == IPPROTO_TCP) {
-                    if (skb->len < sizeof(struct iphdr) + sizeof(struct icmphdr) + inner_hlen + 8) {
-                        printk(KERN_DEBUG "xt_NAT DNAT: Drop related ICMP packet witch truncated TCP header\n");
-                        return NF_DROP;
-                    }
                     skb_set_transport_header(skb, sizeof(struct iphdr) + sizeof(struct icmphdr) + inner_hlen);
                     tcp = (struct tcphdr *)skb_transport_header(skb);
                     skb_reset_transport_header(skb);
@@ -1093,11 +1151,6 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                     ip->daddr = session->data->in_addr;
                     rcu_read_unlock_bh();
                 } else if (ip->protocol == IPPROTO_UDP) {
-                    if (skb->len < sizeof(struct iphdr) + sizeof(struct icmphdr) + inner_hlen + 8) {
-                        printk(KERN_DEBUG "xt_NAT DNAT: Drop related ICMP packet witch truncated UDP header\n");
-                        return NF_DROP;
-                    }
-
                     skb_set_transport_header(skb, sizeof(struct iphdr) + sizeof(struct icmphdr) + inner_hlen);
                     udp = (struct udphdr *)skb_transport_header(skb);
                     skb_reset_transport_header(skb);
@@ -1117,11 +1170,6 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                     ip->daddr = session->data->in_addr;
                     rcu_read_unlock_bh();
                 } else if (ip->protocol == IPPROTO_ICMP) {
-                    if (skb->len < sizeof(struct iphdr) + sizeof(struct icmphdr) + inner_hlen + 8) {
-                        printk(KERN_DEBUG "xt_NAT DNAT: Drop related ICMP packet witch truncated ICMP header\n");
-                        return NF_DROP;
-                    }
-
                     skb_set_transport_header(skb, sizeof(struct iphdr) + sizeof(struct icmphdr) + inner_hlen);
                     icmp = (struct icmphdr *)skb_transport_header(skb);
                     skb_reset_transport_header(skb);
@@ -1187,6 +1235,12 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 atomic64_inc(&dnat_dropped);
             }
         } else {
+            if (unlikely(compat_skb_ensure_writable(skb, ip_hdrlen(skb)))) {
+                printk(KERN_DEBUG "xt_NAT DNAT: Drop unwritable packet\n");
+                return NF_DROP;
+            }
+            ip = (struct iphdr *)skb_network_header(skb);
+
             nat_port = 0;
             rcu_read_lock_bh();
             session = lookup_session(ht_outer, ip->protocol, ip->daddr, nat_port);
