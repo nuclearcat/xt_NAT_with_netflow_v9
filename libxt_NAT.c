@@ -48,6 +48,9 @@ static void nat_tg_check(unsigned int flags)
     if (flags == (F_SNAT | F_DNAT))
         xtables_error(PARAMETER_PROBLEM,
                       "NAT: only one action can be used at a time");
+    if (flags == 0)
+        xtables_error(PARAMETER_PROBLEM,
+                      "NAT: --snat or --dnat is required");
 }
 
 static void nat_tg_save(const void *ip,

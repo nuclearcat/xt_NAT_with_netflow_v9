@@ -1558,12 +1558,25 @@ static void nat_proc_remove(void)
     proc_net_nat = NULL;
 }
 
+static int nat_tg_check(const struct xt_tgchk_param *par)
+{
+    const struct xt_nat_tginfo *info = par->targinfo;
+
+    if (info->variant != XTNAT_SNAT && info->variant != XTNAT_DNAT) {
+        printk(KERN_INFO "xt_NAT: rejecting rule with unknown variant %u\n", info->variant);
+        return -EINVAL;
+    }
+
+    return 0;
+}
+
 static struct xt_target nat_tg_reg __read_mostly = {
     .name     = "NAT",
     .revision = 0,
     .family   = NFPROTO_IPV4,
     .hooks    = (1 << NF_INET_FORWARD) | (1 << NF_INET_PRE_ROUTING) | (1 << NF_INET_POST_ROUTING),
     .target   = nat_tg,
+    .checkentry = nat_tg_check,
     .targetsize = sizeof(struct xt_nat_tginfo),
     .me       = THIS_MODULE,
 };
