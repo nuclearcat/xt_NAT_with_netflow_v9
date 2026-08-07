@@ -66,6 +66,16 @@ static DEFINE_SPINLOCK(sessions_timer_lock);
 static DEFINE_SPINLOCK(users_timer_lock);
 static struct timer_list sessions_cleanup_timer, users_cleanup_timer, nf_send_timer;
 
+/* All three timers re-arm themselves from their own callback, so
+ * del_timer_sync() alone is not enough to stop them - the caller has to
+ * prevent the restart first. NONE means the timers were never set up, so
+ * teardown after a failed init must not touch them.
+ */
+#define NAT_TIMERS_NONE 0
+#define NAT_TIMERS_RUN  1
+#define NAT_TIMERS_STOP 2
+static atomic_t timers_state = ATOMIC_INIT(NAT_TIMERS_NONE);
+
 struct proc_dir_entry *proc_net_nat;
 
 struct netflow_sock {
@@ -1167,7 +1177,8 @@ static void users_cleanup_timer_callback( struct timer_list *timer )
         }
         spin_unlock_bh(&ht_users[i].lock);
     }
-    mod_timer( &users_cleanup_timer, jiffies + msecs_to_jiffies(1000) );
+    if (likely(atomic_read(&timers_state) == NAT_TIMERS_RUN))
+        mod_timer( &users_cleanup_timer, jiffies + msecs_to_jiffies(1000) );
     spin_unlock_bh(&users_timer_lock);
 }
 
@@ -1234,7 +1245,8 @@ static void sessions_cleanup_timer_callback( struct timer_list *timer )
         spin_unlock_bh(&ht_outer[i].lock);
     }
 
-    mod_timer( &sessions_cleanup_timer, jiffies + msecs_to_jiffies(100) );
+    if (likely(atomic_read(&timers_state) == NAT_TIMERS_RUN))
+        mod_timer( &sessions_cleanup_timer, jiffies + msecs_to_jiffies(100) );
     spin_unlock_bh(&sessions_timer_lock);
 }
 
@@ -1242,8 +1254,40 @@ static void nf_send_timer_callback( struct timer_list *timer )
 {
     spin_lock_bh(&nfsend_lock);
     netflow_export_pdu_v9();
-    mod_timer( &nf_send_timer, jiffies + msecs_to_jiffies(1000) );
+    if (likely(atomic_read(&timers_state) == NAT_TIMERS_RUN))
+        mod_timer( &nf_send_timer, jiffies + msecs_to_jiffies(1000) );
     spin_unlock_bh(&nfsend_lock);
+}
+
+static void nat_timers_setup(void)
+{
+    timer_setup( &sessions_cleanup_timer, sessions_cleanup_timer_callback, 0 );
+    timer_setup( &users_cleanup_timer, users_cleanup_timer_callback, 0 );
+    timer_setup( &nf_send_timer, nf_send_timer_callback, 0 );
+
+    /* has to be RUN before the first arm, otherwise the first callback to
+     * run would take itself for a teardown and never re-arm */
+    atomic_set(&timers_state, NAT_TIMERS_RUN);
+
+    mod_timer( &sessions_cleanup_timer, jiffies + msecs_to_jiffies(10 * 1000) );
+    mod_timer( &users_cleanup_timer, jiffies + msecs_to_jiffies(60 * 1000) );
+    mod_timer( &nf_send_timer, jiffies + msecs_to_jiffies(1000) );
+}
+
+static void nat_timers_stop(void)
+{
+    /* Stop the callbacks re-arming before waiting for them. atomic_xchg() is
+     * a full barrier, so the new state is visible to a callback that is about
+     * to decide whether to re-arm. Must not be called with any lock a
+     * callback takes held: compat_del_timer_sync() waits for a running
+     * callback to finish, and it may sleep.
+     */
+    if (atomic_xchg(&timers_state, NAT_TIMERS_STOP) == NAT_TIMERS_NONE)
+        return;
+
+    compat_del_timer_sync( &sessions_cleanup_timer );
+    compat_del_timer_sync( &users_cleanup_timer );
+    compat_del_timer_sync( &nf_send_timer );
 }
 
 static int nat_seq_show(struct seq_file *m, void *v)
@@ -1476,20 +1520,7 @@ static int __init nat_tg_init(void)
     proc_create("users", 0644, proc_net_nat, &users_seq_fops);
     proc_create("statistics", 0644, proc_net_nat, &stat_seq_fops);
 
-    spin_lock_bh(&sessions_timer_lock);
-    timer_setup( &sessions_cleanup_timer, sessions_cleanup_timer_callback, 0 );
-    mod_timer( &sessions_cleanup_timer, jiffies + msecs_to_jiffies(10 * 1000) );
-    spin_unlock_bh(&sessions_timer_lock);
-
-    spin_lock_bh(&users_timer_lock);
-    timer_setup( &users_cleanup_timer, users_cleanup_timer_callback, 0 );
-    mod_timer( &users_cleanup_timer, jiffies + msecs_to_jiffies(60 * 1000) );
-    spin_unlock_bh(&users_timer_lock);
-
-    spin_lock_bh(&nfsend_lock);
-    timer_setup( &nf_send_timer, nf_send_timer_callback, 0 );
-    mod_timer( &nf_send_timer, jiffies + msecs_to_jiffies(1000) );
-    spin_unlock_bh(&nfsend_lock);
+    nat_timers_setup();
 
     return xt_register_target(&nat_tg_reg);
 }
@@ -1498,12 +1529,7 @@ static void __exit nat_tg_exit(void)
 {
     xt_unregister_target(&nat_tg_reg);
 
-    spin_lock_bh(&sessions_timer_lock);
-    spin_lock_bh(&users_timer_lock);
-    spin_lock_bh(&nfsend_lock);
-    compat_del_timer_sync( &sessions_cleanup_timer );
-    compat_del_timer_sync( &users_cleanup_timer );
-    compat_del_timer_sync( &nf_send_timer );
+    nat_timers_stop();
 
     remove_proc_entry( "sessions", proc_net_nat );
     remove_proc_entry( "users", proc_net_nat );
@@ -1524,10 +1550,6 @@ static void __exit nat_tg_exit(void)
         usock->sock = NULL;
         vfree(usock);
     }
-
-    spin_unlock_bh(&sessions_timer_lock);
-    spin_unlock_bh(&users_timer_lock);
-    spin_unlock_bh(&nfsend_lock);
 
     printk(KERN_INFO "Module xt_NAT unloaded\n");
 }
