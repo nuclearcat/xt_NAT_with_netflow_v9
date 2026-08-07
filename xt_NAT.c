@@ -763,6 +763,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
     uint32_t nat_addr;
     uint16_t nat_port;
     unsigned int inner_hlen;
+    unsigned int icmp_off;
     skb_frag_t *frag;
     const struct xt_nat_tginfo *info = par->targinfo;
 
@@ -1150,6 +1151,21 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                     ip->daddr = session->data->in_addr;
                     rcu_read_unlock_bh();
                 }
+
+                /* The ICMP checksum covers the whole message, including the
+                 * quoted header we just rewrote - addresses, ports and the
+                 * quoted header's own checksum. Recompute it rather than try
+                 * to fold in each of those edits separately; this is the
+                 * error path, not the fast path.
+                 */
+                icmp_off = skb_network_offset(skb) + sizeof(struct iphdr);
+                icmp = (struct icmphdr *)(skb_network_header(skb) + sizeof(struct iphdr));
+                icmp->checksum = 0;
+                icmp->checksum = csum_fold(skb_checksum(skb, icmp_off,
+                                                        skb->len - icmp_off, 0));
+                /* skb->csum described the packet as it arrived */
+                if (skb->ip_summed == CHECKSUM_COMPLETE)
+                    skb->ip_summed = CHECKSUM_NONE;
                 return NF_ACCEPT;
             }
             rcu_read_lock_bh();
