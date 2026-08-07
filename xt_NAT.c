@@ -447,6 +447,7 @@ static void update_user_limits(const u_int8_t proto, const u_int32_t addr, const
 {
     struct user_htable_ent *user;
     struct hlist_head *head;
+    uint16_t *count;
     unsigned int hash, is_found;
     unsigned int sz;
 
@@ -461,16 +462,19 @@ static void update_user_limits(const u_int8_t proto, const u_int32_t addr, const
         }
     }
 
-    if (likely(is_found==1)) {
-        user->idle = 0;
-        if (proto == IPPROTO_TCP) {
-            user->tcp_count += operation;
-        } else if (proto == IPPROTO_UDP) {
-            user->udp_count += operation;
-        } else {
-            user->other_count += operation;
+    if (unlikely(is_found==0)) {
+        /* There is nothing to decrement if the user entry is already gone.
+         * Creating one here would apply -1 to a freshly zeroed counter and
+         * wrap it to 65535, which locks the subscriber out permanently:
+         * check_user_limits() then always refuses, and the cleanup timer
+         * never reaps the entry because it only ages a user whose counters
+         * are all zero.
+         */
+        if (operation < 0) {
+            spin_unlock_bh(&ht_users[hash].lock);
+            return;
         }
-    } else {
+
         sz = sizeof(struct user_htable_ent);
         user = kzalloc(sz, GFP_ATOMIC);
 
@@ -481,21 +485,31 @@ static void update_user_limits(const u_int8_t proto, const u_int32_t addr, const
         }
 
         user->addr = addr;
-        user->tcp_count = 0;
-        user->udp_count = 0;
-        user->other_count = 0;
-        user->idle = 0;
 
-        if (proto == IPPROTO_TCP) {
-            user->tcp_count += operation;
-        } else if (proto == IPPROTO_UDP) {
-            user->udp_count += operation;
-        } else {
-            user->other_count += operation;
-        }
         hlist_add_head_rcu(&user->list_node, &ht_users[hash].user);
         ht_users[hash].use++;
         atomic64_inc(&users_active);
+    }
+
+    user->idle = 0;
+
+    if (proto == IPPROTO_TCP) {
+        count = &user->tcp_count;
+    } else if (proto == IPPROTO_UDP) {
+        count = &user->udp_count;
+    } else {
+        count = &user->other_count;
+    }
+
+    if (operation < 0) {
+        if (likely(*count > 0)) {
+            (*count)--;
+        } else {
+            printk(KERN_WARNING "xt_NAT update_user_limits ERROR: %pI4 proto %u session count underflow\n",
+                   &addr, proto);
+        }
+    } else {
+        (*count)++;
     }
 
     spin_unlock_bh(&ht_users[hash].lock);
