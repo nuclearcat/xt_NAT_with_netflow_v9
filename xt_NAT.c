@@ -550,7 +550,7 @@ static struct socket *usock_open_sock(const struct sockaddr_storage *addr, void 
         sock->sk->sk_sndbuf = sndbuf;
     else
         sndbuf = sock->sk->sk_sndbuf;
-    error = sock->ops->connect(sock, (struct sockaddr *)addr, sizeof(*addr), 0);
+    error = kernel_connect(sock, (compat_sockaddr_kern *)addr, sizeof(*addr), 0);
     if (error < 0) {
         printk(KERN_WARNING "xt_NAT NEL: error connecting UDP socket %d,"
                " don't worry, will try reconnect later.\n", -error);

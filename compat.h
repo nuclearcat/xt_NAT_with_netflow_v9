@@ -19,6 +19,16 @@
 # define compat_del_timer(t) del_timer(t)
 #endif
 
+/* ---- 6.19 deprecated struct sockaddr for in-kernel callbacks and replaced it
+ *      with struct sockaddr_unsized, a flexible-array variant, in proto_ops
+ *      and in kernel_connect(). 6.18 and earlier still take struct sockaddr.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,19,0)
+# define compat_sockaddr_kern struct sockaddr_unsized
+#else
+# define compat_sockaddr_kern struct sockaddr
+#endif
+
 /* skb_make_writable() was replaced by skb_ensure_writable() in 5.2
  * (36976d70b426 "net: remove skb_make_writable"). The old one returns
  * true on success, the new one 0.
