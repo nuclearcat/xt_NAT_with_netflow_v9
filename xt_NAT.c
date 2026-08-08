@@ -12,6 +12,7 @@
 #include <linux/netfilter/x_tables.h>
 #include <linux/inet.h>
 #include <linux/proc_fs.h>
+#include <linux/percpu.h>
 #include <linux/mm.h>
 #include <net/tcp.h>
 #include "compat.h"
@@ -39,13 +40,43 @@ struct netflow9_pdu pdu;
 struct netflow9_template templateV9;
 static DEFINE_SPINLOCK(nfsend_lock);
 
-static atomic64_t sessions_active = ATOMIC_INIT(0);
+/* Counters touched during normal operation, per CPU. As shared atomic64 these
+ * were three bounces of the same cacheline for every session created and a
+ * fourth for every one freed, across every CPU at once - the exact shape of
+ * cost that has been dominating this module. The failure counters below stay
+ * atomic64: they only fire on error paths, where a contended cacheline is not
+ * the problem.
+ *
+ * active is inc'd by the CPU creating a session and dec'd by whichever CPU
+ * runs the GC, so a single CPU's value can go negative; only the sum across
+ * CPUs is meaningful, which is why it is signed.
+ */
+struct nat_pcpu_stats {
+    u64 tried;
+    u64 created;
+    u64 dup;
+    u64 dnat_dropped;
+    u64 frags;
+    u64 related_icmp;
+    s64 active;
+};
+static DEFINE_PER_CPU(struct nat_pcpu_stats, nat_pcpu_stats);
+
+#define NAT_STAT_INC(f) this_cpu_inc(nat_pcpu_stats.f)
+#define NAT_STAT_DEC(f) this_cpu_dec(nat_pcpu_stats.f)
+
+static s64 nat_stat_sum(size_t off)
+{
+    s64 total = 0;
+    int cpu;
+
+    for_each_possible_cpu(cpu)
+        total += *(s64 *)((char *)per_cpu_ptr(&nat_pcpu_stats, cpu) + off);
+    return total;
+}
+#define NAT_STAT_READ(f) nat_stat_sum(offsetof(struct nat_pcpu_stats, f))
+
 static atomic64_t users_active = ATOMIC_INIT(0);
-static atomic64_t sessions_tried = ATOMIC_INIT(0);
-static atomic64_t sessions_created = ATOMIC_INIT(0);
-static atomic64_t dnat_dropped = ATOMIC_INIT(0);
-static atomic64_t frags = ATOMIC_INIT(0);
-static atomic64_t related_icmp = ATOMIC_INIT(0);
 
 /* Drop accounting. Every one of these used to be a printk on the packet path,
  * which meant a flood of malformed packets - or simply a NAT address running
@@ -62,8 +93,6 @@ static atomic64_t pkt_drop_nosession = ATOMIC_INIT(0);
 static atomic64_t ses_fail_ulimit = ATOMIC_INIT(0);
 static atomic64_t ses_fail_noport = ATOMIC_INIT(0);
 static atomic64_t ses_fail_nomem = ATOMIC_INIT(0);
-/* another CPU created the same session first: work done, but no new session */
-static atomic64_t sessions_dup = ATOMIC_INIT(0);
 
 static char nat_pool_buf[128] = "127.0.0.1-127.0.0.1";
 static char *nat_pool = nat_pool_buf;
@@ -691,7 +720,7 @@ static struct nat_session *create_nat_session(const uint8_t proto, const u_int32
     uint16_t natport;
     unsigned int nataddr_id, hash;
 
-    atomic64_inc(&sessions_tried);
+    NAT_STAT_INC(tried);
 
     if (unlikely(check_user_limits(proto, useraddr) == 0)) {
         atomic64_inc(&ses_fail_ulimit);
@@ -719,7 +748,7 @@ static struct nat_session *create_nat_session(const uint8_t proto, const u_int32
     if (unlikely(existing)) {
         spin_unlock_bh(&create_session_lock[nataddr_id]);
         kmem_cache_free(nat_session_cache, sess);
-        atomic64_inc(&sessions_dup);
+        NAT_STAT_INC(dup);
         return existing;
     }
     rcu_read_unlock_bh();
@@ -766,8 +795,8 @@ static struct nat_session *create_nat_session(const uint8_t proto, const u_int32
     update_user_limits(proto, useraddr, 1);
     netflow_export_flow_v9(proto, useraddr, userport, dstaddr, dstport, nataddr, natport, 1);
 
-    atomic64_inc(&sessions_created);
-    atomic64_inc(&sessions_active);
+    NAT_STAT_INC(created);
+    NAT_STAT_INC(active);
 
     /* published above; the caller drops this read lock */
     rcu_read_lock_bh();
@@ -995,7 +1024,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 return NF_DROP;
             }
             if (unlikely(skb_headlen(skb) < ip_hdrlen(skb) + sizeof(struct tcphdr)))
-                atomic64_inc(&frags);
+                NAT_STAT_INC(frags);
             if (unlikely(compat_skb_ensure_writable(skb, ip_hdrlen(skb) + sizeof(struct tcphdr)))) {
                 atomic64_inc(&pkt_drop_unwritable);
                 return NF_DROP;
@@ -1027,7 +1056,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 rcu_read_unlock_bh();
             } else {
                 rcu_read_unlock_bh();
-                atomic64_inc(&dnat_dropped);
+                NAT_STAT_INC(dnat_dropped);
             }
         } else if (ip->protocol == IPPROTO_UDP) {
             if (unlikely(skb->len < ip_hdrlen(skb) + sizeof(struct udphdr))) {
@@ -1035,7 +1064,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 return NF_DROP;
             }
             if (unlikely(skb_headlen(skb) < ip_hdrlen(skb) + sizeof(struct udphdr)))
-                atomic64_inc(&frags);
+                NAT_STAT_INC(frags);
             if (unlikely(compat_skb_ensure_writable(skb, ip_hdrlen(skb) + sizeof(struct udphdr)))) {
                 atomic64_inc(&pkt_drop_unwritable);
                 return NF_DROP;
@@ -1064,7 +1093,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 rcu_read_unlock_bh();
             } else {
                 rcu_read_unlock_bh();
-                atomic64_inc(&dnat_dropped);
+                NAT_STAT_INC(dnat_dropped);
             }
         } else if (ip->protocol == IPPROTO_ICMP) {
             if (unlikely(skb->len < ip_hdrlen(skb) + sizeof(struct icmphdr))) {
@@ -1084,7 +1113,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             if (icmp->type == 0 || icmp->type == 8) {
                 nat_port = icmp->un.echo.id;
             } else if (icmp->type == 3 || icmp->type == 4 || icmp->type == 5 || icmp->type == 11 || icmp->type == 12 || icmp->type == 31) {
-                atomic64_inc(&related_icmp);
+                NAT_STAT_INC(related_icmp);
                 if (skb->len < ip_hdrlen(skb) + sizeof(struct icmphdr) + sizeof(struct iphdr)) {
                     atomic64_inc(&pkt_drop_trunc);
                     return NF_DROP;
@@ -1229,7 +1258,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 rcu_read_unlock_bh();
             } else {
                 rcu_read_unlock_bh();
-                atomic64_inc(&dnat_dropped);
+                NAT_STAT_INC(dnat_dropped);
             }
         } else {
             if (unlikely(compat_skb_ensure_writable(skb, ip_hdrlen(skb)))) {
@@ -1251,7 +1280,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 rcu_read_unlock_bh();
             } else {
                 rcu_read_unlock_bh();
-                atomic64_inc(&dnat_dropped);
+                NAT_STAT_INC(dnat_dropped);
             }
         }
     }
@@ -1362,7 +1391,7 @@ static void sessions_cleanup_timer_callback( struct timer_list *timer )
                     ht_inner[i].use--;
 
                     call_rcu(&sess->u.rcu, nat_session_free_rcu);
-                    atomic64_dec(&sessions_active);
+                    NAT_STAT_DEC(active);
                     update_user_limits(proto, addr, -1);
                 }
             }
@@ -1509,13 +1538,13 @@ static const struct proc_ops users_seq_fops = {
 
 static int stat_seq_show(struct seq_file *m, void *v)
 {
-    seq_printf(m, "Active NAT sessions: %lld\n", atomic64_read(&sessions_active));
-    seq_printf(m, "Tried NAT sessions: %lld\n", atomic64_read(&sessions_tried));
-    seq_printf(m, "Created NAT sessions: %lld\n", atomic64_read(&sessions_created));
-    seq_printf(m, "Raced session creates: %lld\n", atomic64_read(&sessions_dup));
-    seq_printf(m, "DNAT dropped pkts: %lld\n", atomic64_read(&dnat_dropped));
-    seq_printf(m, "Fragmented pkts: %lld\n", atomic64_read(&frags));
-    seq_printf(m, "Related ICMP pkts: %lld\n", atomic64_read(&related_icmp));
+    seq_printf(m, "Active NAT sessions: %lld\n", NAT_STAT_READ(active));
+    seq_printf(m, "Tried NAT sessions: %lld\n", NAT_STAT_READ(tried));
+    seq_printf(m, "Created NAT sessions: %lld\n", NAT_STAT_READ(created));
+    seq_printf(m, "Raced session creates: %lld\n", NAT_STAT_READ(dup));
+    seq_printf(m, "DNAT dropped pkts: %lld\n", NAT_STAT_READ(dnat_dropped));
+    seq_printf(m, "Fragmented pkts: %lld\n", NAT_STAT_READ(frags));
+    seq_printf(m, "Related ICMP pkts: %lld\n", NAT_STAT_READ(related_icmp));
     seq_printf(m, "Active Users: %lld\n", atomic64_read(&users_active));
     seq_printf(m, "Max sessions per user: %d\n", READ_ONCE(user_max_sessions));
 
