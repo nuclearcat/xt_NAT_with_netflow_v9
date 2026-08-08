@@ -140,6 +140,8 @@ $ ./run-vm.sh --bench                  # + session setup rate
 
 See [TESTING.md](TESTING.md) for what each mode proves, how to build a suitable
 debug kernel, the benchmark modes, and the current performance baseline.
+[TODO.md](TODO.md) records the ideas that have been thought through but not
+built, including the ones deliberately rejected and why.
 
 ## Installation
 ```
