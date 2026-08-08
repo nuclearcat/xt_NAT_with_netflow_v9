@@ -1,5 +1,5 @@
 /*
- * cps-gen.c - minimal UDP flood for measuring xt_NAT session setup rate.
+ * cps-gen.c - minimal UDP flood for measuring xt_CGNAT session setup rate.
  *
  * Every distinct (source address, source port) pair is one new NAT session, so
  * driving a stream of unique pairs at the subscriber side of the test topology

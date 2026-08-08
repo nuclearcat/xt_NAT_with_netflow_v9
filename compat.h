@@ -4,8 +4,8 @@
  * License is GPLv2.
  */
 
-#ifndef COMPAT_NAT_H
-#define COMPAT_NAT_H
+#ifndef COMPAT_CGNAT_H
+#define COMPAT_CGNAT_H
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,2,0)
 # define sock_create_kern(f, t, p, s) sock_create_kern(&init_net, f, t, p, s)
@@ -39,4 +39,4 @@
 # define compat_skb_ensure_writable(s, l) (skb_make_writable(s, l) ? 0 : -ENOMEM)
 #endif
 
-#endif /* COMPAT_NAT_H */
+#endif /* COMPAT_CGNAT_H */

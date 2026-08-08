@@ -17,7 +17,7 @@
 #include <linux/mm.h>
 #include <net/tcp.h>
 #include "compat.h"
-#include "xt_NAT.h"
+#include "xt_CGNAT.h"
 
 #define FLAG_REPLIED   (1 << 0) /* 000001 */
 #define FLAG_TCP_FIN   (1 << 1) /* 000010 */
@@ -115,7 +115,7 @@ MODULE_PARM_DESC(users_hash_size, "users hash size, default = 64k");
 
 /* Per-user session cap, per protocol. Was hardcoded at 4096 in three places
  * while the README advertised 1000. Mode 0644, so it is writable at runtime
- * through /sys/module/xt_NAT/parameters/user_max_sessions without needing a
+ * through /sys/module/xt_CGNAT/parameters/user_max_sessions without needing a
  * /proc write path. The per-user counters are uint16_t, so values above
  * USHRT_MAX cannot be represented and are clamped where it is read.
  */
@@ -251,7 +251,7 @@ struct netflow_sock {
     struct sockaddr_storage addr;   // destination
 };
 
-struct xt_nat_htable {
+struct xt_cgnat_htable {
     uint32_t use;
     spinlock_t lock;
     struct hlist_head session;
@@ -305,7 +305,7 @@ static void nat_session_free_rcu(struct rcu_head *head)
                     container_of(head, struct nat_session, u.rcu));
 }
 
-struct xt_users_htable {
+struct xt_cgnat_users_htable {
     uint32_t use;
     spinlock_t lock;
     struct hlist_head user;
@@ -321,10 +321,10 @@ struct user_htable_ent {
     uint8_t idle;
 };
 
-struct xt_users_htable *ht_users;
+struct xt_cgnat_users_htable *ht_users;
 
 
-struct xt_nat_htable *ht_inner, *ht_outer;
+struct xt_cgnat_htable *ht_inner, *ht_outer;
 
 static char *print_sockaddr(const struct sockaddr_storage *ss)
 {
@@ -420,7 +420,7 @@ static int pool_table_create(void)
         spin_lock_init(&create_session_lock[i]);
     }
 
-    printk(KERN_INFO "xt_NAT DEBUG: nat pool table mem: %zu\n", sz);
+    printk(KERN_INFO "xt_CGNAT DEBUG: nat pool table mem: %zu\n", sz);
 
     /* 8KB per protocol per NAT address: 24KB an address, 6MB for a /24, 100MB
      * for a /20. A pool large enough for that to hurt could not hold the
@@ -429,13 +429,13 @@ static int pool_table_create(void)
     bsz = (size_t)pool_size * NAT_PROTO_SLOTS * NAT_PORT_LONGS * sizeof(unsigned long);
     nat_port_bitmap = kvzalloc(bsz, GFP_KERNEL);
     if (nat_port_bitmap == NULL) {
-        printk(KERN_ERR "xt_NAT: cannot allocate %zu bytes of port bitmaps for %u addresses\n",
+        printk(KERN_ERR "xt_CGNAT: cannot allocate %zu bytes of port bitmaps for %u addresses\n",
                bsz, pool_size);
         kvfree(create_session_lock);
         create_session_lock = NULL;
         return -ENOMEM;
     }
-    printk(KERN_INFO "xt_NAT DEBUG: port bitmap mem: %zu (%u addresses)\n", bsz, pool_size);
+    printk(KERN_INFO "xt_CGNAT DEBUG: port bitmap mem: %zu (%u addresses)\n", bsz, pool_size);
 
     return 0;
 }
@@ -447,7 +447,7 @@ static void pool_table_remove(void)
     kvfree(nat_port_bitmap);
     nat_port_bitmap = NULL;
 
-    printk(KERN_INFO "xt_NAT pool_table_remove DEBUG: removed\n");
+    printk(KERN_INFO "xt_CGNAT pool_table_remove DEBUG: removed\n");
 }
 
 
@@ -456,7 +456,7 @@ static int users_htable_create(void)
     size_t sz; /* (bytes) */
     int i;
 
-    sz = sizeof(struct xt_users_htable) * (size_t)users_hash_size;
+    sz = sizeof(struct xt_cgnat_users_htable) * (size_t)users_hash_size;
     ht_users = kvzalloc(sz, GFP_KERNEL);
 
     if (ht_users == NULL)
@@ -468,7 +468,7 @@ static int users_htable_create(void)
         ht_users[i].use = 0;
     }
 
-    printk(KERN_INFO "xt_NAT DEBUG: users htable mem: %zu\n", sz);
+    printk(KERN_INFO "xt_CGNAT DEBUG: users htable mem: %zu\n", sz);
     return 0;
 }
 
@@ -492,13 +492,13 @@ static void users_htable_remove(void)
         }
 
         if (ht_users[i].use != 0) {
-            printk(KERN_WARNING "xt_NAT users_htable_remove ERROR: bad use value: %u in element %d\n", ht_users[i].use, i);
+            printk(KERN_WARNING "xt_CGNAT users_htable_remove ERROR: bad use value: %u in element %d\n", ht_users[i].use, i);
         }
         spin_unlock_bh(&ht_users[i].lock);
     }
     kvfree(ht_users);
     ht_users = NULL;
-    printk(KERN_INFO "xt_NAT users_htable_remove DONE\n");
+    printk(KERN_INFO "xt_CGNAT users_htable_remove DONE\n");
     return;
 }
 
@@ -532,13 +532,13 @@ static void nat_htable_remove(void)
             call_rcu(&sess->u.rcu, nat_session_free_rcu);
         }
         if (ht_inner[i].use != 0)
-            printk(KERN_WARNING "xt_NAT nat_htable_remove inner ERROR: bad use value: %u in element %d\n", ht_inner[i].use, i);
+            printk(KERN_WARNING "xt_CGNAT nat_htable_remove inner ERROR: bad use value: %u in element %d\n", ht_inner[i].use, i);
         spin_unlock_bh(&ht_inner[i].lock);
     }
 
     for (i = 0; i < nat_hash_size; i++) {
         if (ht_outer[i].use != 0)
-            printk(KERN_WARNING "xt_NAT nat_htable_remove outer ERROR: bad use value: %u in element %d\n", ht_outer[i].use, i);
+            printk(KERN_WARNING "xt_CGNAT nat_htable_remove outer ERROR: bad use value: %u in element %d\n", ht_outer[i].use, i);
     }
 
     kvfree(ht_inner);
@@ -546,7 +546,7 @@ static void nat_htable_remove(void)
     ht_inner = NULL;
     ht_outer = NULL;
 
-    printk(KERN_INFO "xt_NAT nat_htable_remove DONE\n");
+    printk(KERN_INFO "xt_CGNAT nat_htable_remove DONE\n");
     return;
 }
 
@@ -556,7 +556,7 @@ static int nat_htable_create(void)
     size_t sz; /* (bytes) */
     int i;
 
-    sz = sizeof(struct xt_nat_htable) * (size_t)nat_hash_size;
+    sz = sizeof(struct xt_cgnat_htable) * (size_t)nat_hash_size;
     ht_inner = kvzalloc(sz, GFP_KERNEL);
     if (ht_inner == NULL)
         return -ENOMEM;
@@ -567,7 +567,7 @@ static int nat_htable_create(void)
         ht_inner[i].use = 0;
     }
 
-    printk(KERN_INFO "xt_NAT DEBUG: sessions htable inner mem: %zu\n", sz);
+    printk(KERN_INFO "xt_CGNAT DEBUG: sessions htable inner mem: %zu\n", sz);
 
     ht_outer = kvzalloc(sz, GFP_KERNEL);
     if (ht_outer == NULL) {
@@ -582,7 +582,7 @@ static int nat_htable_create(void)
         ht_outer[i].use = 0;
     }
 
-    printk(KERN_INFO "xt_NAT DEBUG: sessions htable outer mem: %zu\n", sz);
+    printk(KERN_INFO "xt_CGNAT DEBUG: sessions htable outer mem: %zu\n", sz);
     return 0;
 }
 
@@ -745,7 +745,7 @@ static void update_user_limits(const u_int8_t proto, const u_int32_t addr, const
 
         if (user == NULL) {
             atomic64_inc(&ses_fail_nomem);
-            printk_ratelimited(KERN_WARNING "xt_NAT update_user_limits ERROR: Cannot allocate memory for user_session\n");
+            printk_ratelimited(KERN_WARNING "xt_CGNAT update_user_limits ERROR: Cannot allocate memory for user_session\n");
             spin_unlock_bh(&ht_users[hash].lock);
             return;
         }
@@ -771,7 +771,7 @@ static void update_user_limits(const u_int8_t proto, const u_int32_t addr, const
         if (likely(*count > 0)) {
             (*count)--;
         } else {
-            printk(KERN_WARNING "xt_NAT update_user_limits ERROR: %pI4 proto %u session count underflow\n",
+            printk(KERN_WARNING "xt_CGNAT update_user_limits ERROR: %pI4 proto %u session count underflow\n",
                    &addr, proto);
         }
     } else {
@@ -795,7 +795,7 @@ static struct socket *usock_open_sock(const struct sockaddr_storage *addr, void 
     int error;
 
     if ((error = sock_create_kern(addr->ss_family, SOCK_DGRAM, IPPROTO_UDP, &sock)) < 0) {
-        printk(KERN_WARNING "xt_NAT NEL: sock_create_kern error %d\n", -error);
+        printk(KERN_WARNING "xt_CGNAT NEL: sock_create_kern error %d\n", -error);
         return NULL;
     }
     sock->sk->sk_allocation = GFP_ATOMIC;
@@ -812,7 +812,7 @@ static struct socket *usock_open_sock(const struct sockaddr_storage *addr, void 
         sndbuf = sock->sk->sk_sndbuf;
     error = kernel_connect(sock, (compat_sockaddr_kern *)addr, sizeof(*addr), 0);
     if (error < 0) {
-        printk(KERN_WARNING "xt_NAT NEL: error connecting UDP socket %d,"
+        printk(KERN_WARNING "xt_CGNAT NEL: error connecting UDP socket %d,"
                " don't worry, will try reconnect later.\n", -error);
         /* ENETUNREACH when no interfaces */
         sock_release(sock);
@@ -841,7 +841,7 @@ static void netflow_sendmsg(void *buffer, const int len)
                 sock_release(usock->sock);
             usock->sock = NULL;
         } else if (ret == -EAGAIN) {
-            printk(KERN_WARNING "xt_NAT NEL: increase sndbuf!\n");
+            printk(KERN_WARNING "xt_CGNAT NEL: increase sndbuf!\n");
         }
     }
 }
@@ -909,7 +909,7 @@ static struct nat_session *create_nat_session(const uint8_t proto, const u_int32
     if (nat_det_enabled()) {
         if (unlikely(!nat_det_map(useraddr, &nataddr, &lo, &hi))) {
             atomic64_inc(&ses_fail_nomap);
-            printk_ratelimited(KERN_NOTICE "xt_NAT: %pI4 is outside the deterministic subscriber range\n",
+            printk_ratelimited(KERN_NOTICE "xt_CGNAT: %pI4 is outside the deterministic subscriber range\n",
                                &useraddr);
             return NULL;
         }
@@ -919,7 +919,7 @@ static struct nat_session *create_nat_session(const uint8_t proto, const u_int32
 
     if (unlikely(check_user_limits(proto, useraddr) == 0)) {
         atomic64_inc(&ses_fail_ulimit);
-        printk_ratelimited(KERN_NOTICE "xt_NAT: %pI4 exceed max allowed sessions\n", &useraddr);
+        printk_ratelimited(KERN_NOTICE "xt_CGNAT: %pI4 exceed max allowed sessions\n", &useraddr);
         return NULL;
     }
 
@@ -928,7 +928,7 @@ static struct nat_session *create_nat_session(const uint8_t proto, const u_int32
     sess = kmem_cache_zalloc(nat_session_cache, GFP_ATOMIC);
     if (unlikely(sess == NULL)) {
         atomic64_inc(&ses_fail_nomem);
-        printk_ratelimited(KERN_WARNING "xt_NAT create_nat_session ERROR: Cannot allocate session\n");
+        printk_ratelimited(KERN_WARNING "xt_CGNAT create_nat_session ERROR: Cannot allocate session\n");
         return NULL;
     }
 
@@ -954,7 +954,7 @@ static struct nat_session *create_nat_session(const uint8_t proto, const u_int32
         rcu_read_unlock_bh();
         if (natport == 0) {
             atomic64_inc(&ses_fail_noport);
-            printk_ratelimited(KERN_WARNING "xt_NAT create_nat_session ERROR: Not found free nat port for %d %pI4:%u -> %pI4:XXXX\n", proto, &useraddr, userport, &nataddr);
+            printk_ratelimited(KERN_WARNING "xt_CGNAT create_nat_session ERROR: Not found free nat port for %d %pI4:%u -> %pI4:XXXX\n", proto, &useraddr, userport, &nataddr);
             spin_unlock_bh(&create_session_lock[nataddr_id]);
             kmem_cache_free(nat_session_cache, sess);
             return NULL;
@@ -1009,7 +1009,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
     uint16_t nat_port;
     unsigned int inner_hlen;
     unsigned int icmp_off;
-    const struct xt_nat_tginfo *info = par->targinfo;
+    const struct xt_cgnat_tginfo *info = par->targinfo;
 
     if (unlikely(skb->protocol != htons(ETH_P_IP))) {
         atomic64_inc(&pkt_drop_proto);
@@ -1031,7 +1031,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
         return NF_DROP;
     }
 
-    if (info->variant == XTNAT_SNAT) {
+    if (info->variant == XT_CGNAT_SNAT) {
         if (ip->protocol == IPPROTO_TCP) {
             if (unlikely(skb->len < ip_hdrlen(skb) + sizeof(struct tcphdr))) {
                 atomic64_inc(&pkt_drop_trunc);
@@ -1209,7 +1209,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 rcu_read_unlock_bh();
             }
         }
-    } else if (info->variant == XTNAT_DNAT) {
+    } else if (info->variant == XT_CGNAT_DNAT) {
         if (ip->protocol == IPPROTO_TCP) {
             if (unlikely(skb->len < ip_hdrlen(skb) + sizeof(struct tcphdr))) {
                 atomic64_inc(&pkt_drop_trunc);
@@ -1490,7 +1490,7 @@ static void users_cleanup_timer_callback( struct timer_list *timer )
     spin_lock_bh(&users_timer_lock);
 
     if (ht_users == NULL) {
-        printk(KERN_WARNING "xt_NAT USERS CLEAN ERROR: Found null ptr for ht_users\n");
+        printk(KERN_WARNING "xt_CGNAT USERS CLEAN ERROR: Found null ptr for ht_users\n");
         spin_unlock_bh(&users_timer_lock);
         return;
     }
@@ -1539,7 +1539,7 @@ static void sessions_cleanup_timer_callback( struct timer_list *timer )
     spin_lock_bh(&sessions_timer_lock);
 
     if (ht_inner == NULL || ht_outer == NULL) {
-        printk(KERN_WARNING "xt_NAT SESSIONS CLEAN ERROR: Found null ptr for ht_inner/ht_outer\n");
+        printk(KERN_WARNING "xt_CGNAT SESSIONS CLEAN ERROR: Found null ptr for ht_inner/ht_outer\n");
         spin_unlock_bh(&sessions_timer_lock);
         return;
     }
@@ -1812,19 +1812,19 @@ static int add_nf_destinations(const char *ptr)
             sin->sin_port = htons(simple_strtoul(++end, NULL, 0));
 
         if (!succ) {
-            printk(KERN_ERR "xt_NAT: can't parse netflow destination: %.*s\n",
+            printk(KERN_ERR "xt_CGNAT: can't parse netflow destination: %.*s\n",
                    len, ptr);
             continue;
         }
 
         if (!(usock = vmalloc(sizeof(*usock)))) {
-            printk(KERN_ERR "xt_NAT: can't vmalloc socket\n");
+            printk(KERN_ERR "xt_CGNAT: can't vmalloc socket\n");
             return -ENOMEM;
         }
         memset(usock, 0, sizeof(*usock));
         usock->addr = ss;
         list_add_tail(&usock->list, &usock_list);
-        printk(KERN_INFO "xt_NAT NEL: add destination %s\n", print_sockaddr(&usock->addr));
+        printk(KERN_INFO "xt_CGNAT NEL: add destination %s\n", print_sockaddr(&usock->addr));
     }
     return 0;
 }
@@ -1857,10 +1857,10 @@ static void nat_proc_remove(void)
 
 static int nat_tg_check(const struct xt_tgchk_param *par)
 {
-    const struct xt_nat_tginfo *info = par->targinfo;
+    const struct xt_cgnat_tginfo *info = par->targinfo;
 
-    if (info->variant != XTNAT_SNAT && info->variant != XTNAT_DNAT) {
-        printk(KERN_INFO "xt_NAT: rejecting rule with unknown variant %u\n", info->variant);
+    if (info->variant != XT_CGNAT_SNAT && info->variant != XT_CGNAT_DNAT) {
+        printk(KERN_INFO "xt_CGNAT: rejecting rule with unknown variant %u\n", info->variant);
         return -EINVAL;
     }
 
@@ -1868,13 +1868,13 @@ static int nat_tg_check(const struct xt_tgchk_param *par)
 }
 
 static struct xt_target nat_tg_reg __read_mostly = {
-    .name     = "NAT",
+    .name     = "CGNAT",
     .revision = 0,
     .family   = NFPROTO_IPV4,
     .hooks    = (1 << NF_INET_FORWARD) | (1 << NF_INET_PRE_ROUTING) | (1 << NF_INET_POST_ROUTING),
     .target   = nat_tg,
     .checkentry = nat_tg_check,
-    .targetsize = sizeof(struct xt_nat_tginfo),
+    .targetsize = sizeof(struct xt_cgnat_tginfo),
     .me       = THIS_MODULE,
 };
 
@@ -1892,7 +1892,7 @@ static int __init nat_pool_parse(void)
     u_int32_t subnet;
 
     if (strscpy(buf, nat_pool, sizeof(buf)) < 0) {
-        printk(KERN_ERR "xt_NAT: nat_pool string too long\n");
+        printk(KERN_ERR "xt_CGNAT: nat_pool string too long\n");
         return -EINVAL;
     }
 
@@ -1903,7 +1903,7 @@ static int __init nat_pool_parse(void)
 
     sep = range ? strchr(range, '-') : NULL;
     if (!sep) {
-        printk(KERN_ERR "xt_NAT: nat_pool needs <start>-<end>\n");
+        printk(KERN_ERR "xt_CGNAT: nat_pool needs <start>-<end>\n");
         return -EINVAL;
     }
     *sep = '\0';
@@ -1911,31 +1911,31 @@ static int __init nat_pool_parse(void)
     nat_pool_end   = in_aton(sep + 1);
 
     if (!nat_pool_start || !nat_pool_end || ntohl(nat_pool_start) > ntohl(nat_pool_end)) {
-        printk(KERN_ERR "xt_NAT: bad IP pool %pI4 to %pI4\n", &nat_pool_start, &nat_pool_end);
+        printk(KERN_ERR "xt_CGNAT: bad IP pool %pI4 to %pI4\n", &nat_pool_start, &nat_pool_end);
         return -EINVAL;
     }
-    printk(KERN_INFO "xt_NAT DEBUG: IP Pool from %pI4 to %pI4\n", &nat_pool_start, &nat_pool_end);
+    printk(KERN_INFO "xt_CGNAT DEBUG: IP Pool from %pI4 to %pI4\n", &nat_pool_start, &nat_pool_end);
 
     if (!sub && !portstr)                       /* shared-port mode, as before */
         return 0;
     if (!sub || !portstr) {
-        printk(KERN_ERR "xt_NAT: deterministic mode needs both <subscriber_cidr> and <ports_per_subscriber>\n");
+        printk(KERN_ERR "xt_CGNAT: deterministic mode needs both <subscriber_cidr> and <ports_per_subscriber>\n");
         return -EINVAL;
     }
 
     sep = strchr(sub, '/');
     if (!sep) {
-        printk(KERN_ERR "xt_NAT: subscriber range must be a CIDR, e.g. 10.0.0.0/20\n");
+        printk(KERN_ERR "xt_CGNAT: subscriber range must be a CIDR, e.g. 10.0.0.0/20\n");
         return -EINVAL;
     }
     *sep = '\0';
     subnet = in_aton(sub);
     if (kstrtouint(sep + 1, 10, &prefix) || prefix > 32) {
-        printk(KERN_ERR "xt_NAT: bad subscriber prefix length\n");
+        printk(KERN_ERR "xt_CGNAT: bad subscriber prefix length\n");
         return -EINVAL;
     }
     if (kstrtouint(portstr, 10, &ports) || ports < 1 || ports > (NAT_PORT_BITS - NAT_PORT_LO)) {
-        printk(KERN_ERR "xt_NAT: ports_per_subscriber must be 1..%u\n", NAT_PORT_BITS - NAT_PORT_LO);
+        printk(KERN_ERR "xt_CGNAT: ports_per_subscriber must be 1..%u\n", NAT_PORT_BITS - NAT_PORT_LO);
         return -EINVAL;
     }
 
@@ -1944,7 +1944,7 @@ static int __init nat_pool_parse(void)
     nat_det_ports = ports;
     per_addr      = (NAT_PORT_BITS - NAT_PORT_LO) / ports;
     if (per_addr == 0) {
-        printk(KERN_ERR "xt_NAT: ports_per_subscriber larger than the port space\n");
+        printk(KERN_ERR "xt_CGNAT: ports_per_subscriber larger than the port space\n");
         return -EINVAL;
     }
     nat_det_per_addr = per_addr;
@@ -1956,14 +1956,14 @@ static int __init nat_pool_parse(void)
      */
     need = DIV_ROUND_UP(nat_det_count, per_addr);
     if (need > get_pool_size()) {
-        printk(KERN_ERR "xt_NAT: deterministic mapping needs %u NAT addresses for %u subscribers "
+        printk(KERN_ERR "xt_CGNAT: deterministic mapping needs %u NAT addresses for %u subscribers "
                         "at %u ports each (%u per address); the pool has %u\n",
                need, nat_det_count, ports, per_addr, get_pool_size());
         nat_det_ports = 0;
         return -EINVAL;
     }
 
-    printk(KERN_INFO "xt_NAT: deterministic mapping: %u subscribers from %pI4/%u, "
+    printk(KERN_INFO "xt_CGNAT: deterministic mapping: %u subscribers from %pI4/%u, "
                      "%u ports each, %u per address, %u of %u pool addresses used\n",
            nat_det_count, &subnet, prefix, ports, per_addr, need, get_pool_size());
     return 0;
@@ -1973,7 +1973,7 @@ static int __init nat_tg_init(void)
 {
     int ret;
 
-    printk(KERN_INFO "Module xt_NAT loaded\n");
+    printk(KERN_INFO "Module xt_CGNAT loaded\n");
 
     templateV9.FlowSetId	= 0;
     templateV9.Length		= htons(40);
@@ -2005,22 +2005,22 @@ static int __init nat_tg_init(void)
      * allocation check passes and the first packet dereferences it.
      */
     if (nat_hash_size < NAT_HASH_MIN || nat_hash_size > NAT_HASH_MAX) {
-        printk(KERN_ERR "xt_NAT: nat_hash_size must be between %d and %d\n",
+        printk(KERN_ERR "xt_CGNAT: nat_hash_size must be between %d and %d\n",
                NAT_HASH_MIN, NAT_HASH_MAX);
         return -EINVAL;
     }
     if (users_hash_size < NAT_HASH_MIN || users_hash_size > NAT_HASH_MAX) {
-        printk(KERN_ERR "xt_NAT: users_hash_size must be between %d and %d\n",
+        printk(KERN_ERR "xt_CGNAT: users_hash_size must be between %d and %d\n",
                NAT_HASH_MIN, NAT_HASH_MAX);
         return -EINVAL;
     }
     if (user_max_sessions < 1 || user_max_sessions > USHRT_MAX) {
-        printk(KERN_ERR "xt_NAT: user_max_sessions must be between 1 and %d\n", USHRT_MAX);
+        printk(KERN_ERR "xt_CGNAT: user_max_sessions must be between 1 and %d\n", USHRT_MAX);
         return -EINVAL;
     }
 
-    printk(KERN_INFO "xt_NAT DEBUG: NAT hash size: %d\n", nat_hash_size);
-    printk(KERN_INFO "xt_NAT DEBUG: Users hash size: %d\n", users_hash_size);
+    printk(KERN_INFO "xt_CGNAT DEBUG: NAT hash size: %d\n", nat_hash_size);
+    printk(KERN_INFO "xt_CGNAT DEBUG: Users hash size: %d\n", users_hash_size);
 
     /* The layout is load bearing: at exactly 64 bytes the object is one
      * cacheline and SLAB_HWCACHE_ALIGN adds no padding. Adding a field would
@@ -2028,7 +2028,7 @@ static int __init nat_tg_init(void)
      */
     BUILD_BUG_ON(sizeof(struct nat_session) != 64);
 
-    nat_session_cache = kmem_cache_create("xt_NAT_session",
+    nat_session_cache = kmem_cache_create("xt_CGNAT_session",
                                           sizeof(struct nat_session), 0,
                                           SLAB_HWCACHE_ALIGN, NULL);
     if (!nat_session_cache) {
@@ -2052,9 +2052,9 @@ static int __init nat_tg_init(void)
     if (ret < 0)
         goto err_nf_dest;
 
-    proc_net_nat = proc_mkdir("NAT",init_net.proc_net);
+    proc_net_nat = proc_mkdir("CGNAT",init_net.proc_net);
     if (!proc_net_nat) {
-        printk(KERN_ERR "xt_NAT ERROR: cannot create /proc/net/NAT\n");
+        printk(KERN_ERR "xt_CGNAT ERROR: cannot create /proc/net/CGNAT\n");
         ret = -ENOMEM;
         goto err_nf_dest;
     }
@@ -2083,7 +2083,7 @@ err_caches:
     /* nothing has been published yet, so no RCU callbacks can be outstanding */
     kmem_cache_destroy(nat_session_cache);
     nat_session_cache = NULL;
-    printk(KERN_ERR "xt_NAT ERROR: module load failed, error %d\n", ret);
+    printk(KERN_ERR "xt_CGNAT ERROR: module load failed, error %d\n", ret);
     return ret;
 }
 
@@ -2107,13 +2107,14 @@ static void __exit nat_tg_exit(void)
     kmem_cache_destroy(nat_session_cache);
     nat_session_cache = NULL;
 
-    printk(KERN_INFO "Module xt_NAT unloaded\n");
+    printk(KERN_INFO "Module xt_CGNAT unloaded\n");
 }
 
 module_init(nat_tg_init);
 module_exit(nat_tg_exit);
 
-MODULE_DESCRIPTION("Xtables: Full Cone NAT");
-MODULE_AUTHOR("Andrei Sharaev <andr.sharaev@gmail.com>");
+MODULE_DESCRIPTION("Xtables: Carrier-Grade NAT (full cone), derived from xt_NAT");
+MODULE_AUTHOR("Andrei Sharaev <andr.sharaev@gmail.com>");        /* original xt_NAT */
+MODULE_AUTHOR("Denys Fedoryshchenko <denys.f@collabora.com>");
 MODULE_LICENSE("GPL");
-MODULE_ALIAS("ipt_NAT");
+MODULE_ALIAS("ipt_CGNAT");

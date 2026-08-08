@@ -1,12 +1,12 @@
-#ifndef _LINUX_NETFILTER_XT_NAT_H
-#define _LINUX_NETFILTER_XT_NAT_H 1
+#ifndef _LINUX_NETFILTER_XT_CGNAT_H
+#define _LINUX_NETFILTER_XT_CGNAT_H 1
 
-enum xt_nat_target_variant {
-    XTNAT_SNAT,
-    XTNAT_DNAT,
+enum xt_cgnat_target_variant {
+    XT_CGNAT_SNAT,
+    XT_CGNAT_DNAT,
 };
 
-struct xt_nat_tginfo {
+struct xt_cgnat_tginfo {
     uint8_t variant;
 };
 
@@ -63,4 +63,4 @@ struct netflow9_pdu {
 
 #define NETFLOW9_HEADER_SIZE (sizeof(struct netflow9_pdu) - NETFLOW9_RECORDS_MAX * sizeof(struct netflow9_record))
 
-#endif /* _LINUX_NETFILTER_XT_NAT_H */
+#endif /* _LINUX_NETFILTER_XT_CGNAT_H */

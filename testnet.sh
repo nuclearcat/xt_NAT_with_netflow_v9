@@ -4,7 +4,7 @@
 #
 #      netns xtnat-sub                root netns (DUT)              netns xtnat-inet
 #   10.0.0.2 --- xn-s1 <=> xn-s0 10.0.0.1 | 198.51.100.1 xn-i0 <=> xn-i1 --- 198.51.100.2
-#                                    xt_NAT, pool 203.0.113.1-4
+#                                    xt_CGNAT, pool 203.0.113.1-4
 #
 # The NAT pool is deliberately overridable: its size decides how many entries
 # create_session_lock[] has, and therefore how much of the session-creation
@@ -31,7 +31,7 @@ need() { command -v "$1" >/dev/null 2>&1; }
 
 ipt() { iptables "$@"; }
 
-# Where to find libxt_NAT.so. Prefer the build directory so nothing depends on
+# Where to find libxt_CGNAT.so. Prefer the build directory so nothing depends on
 # 'make linstall' having been run; xtables searches a colon-separated list, so
 # keep the system directory too.
 xtables_libdir_setup() {
@@ -39,7 +39,7 @@ xtables_libdir_setup() {
     sysdir=$(pkg-config --variable xtlibdir xtables 2>/dev/null)
     [ -n "$sysdir" ] || sysdir=/usr/lib/xtables
     export XTABLES_LIBDIR="${SRCDIR}:$sysdir"
-    [ -f "$SRCDIR/libxt_NAT.so" ] || [ -f "$sysdir/libxt_NAT.so" ]
+    [ -f "$SRCDIR/libxt_CGNAT.so" ] || [ -f "$sysdir/libxt_CGNAT.so" ]
 }
 
 net_up() {
@@ -95,28 +95,28 @@ net_down() {
 rules_up() {
     ipt -t raw -I PREROUTING 1 -s $SUB_CIDR -j CT --notrack
     ipt -t raw -I PREROUTING 1 -d $POOL_NET -j CT --notrack
-    ipt -t raw -I PREROUTING 1 -d $POOL_NET -j NAT --dnat
+    ipt -t raw -I PREROUTING 1 -d $POOL_NET -j CGNAT --dnat
     # return direction is DNATed in raw, then traverses FORWARD normally
     ipt -I FORWARD 1 -i xn-i0 -o xn-s0 -d $SUB_CIDR -j ACCEPT
     # the NAT target is terminating for what it accepts, so it goes first
-    ipt -I FORWARD 1 -s $SUB_CIDR -o xn-i0 -j NAT --snat
+    ipt -I FORWARD 1 -s $SUB_CIDR -o xn-i0 -j CGNAT --snat
 }
 
 rules_down() {
-    ipt -D FORWARD -s $SUB_CIDR -o xn-i0 -j NAT --snat 2>/dev/null
+    ipt -D FORWARD -s $SUB_CIDR -o xn-i0 -j CGNAT --snat 2>/dev/null
     ipt -D FORWARD -i xn-i0 -o xn-s0 -d $SUB_CIDR -j ACCEPT 2>/dev/null
-    ipt -t raw -D PREROUTING -d $POOL_NET -j NAT --dnat 2>/dev/null
+    ipt -t raw -D PREROUTING -d $POOL_NET -j CGNAT --dnat 2>/dev/null
     ipt -t raw -D PREROUTING -d $POOL_NET -j CT --notrack 2>/dev/null
     ipt -t raw -D PREROUTING -s $SUB_CIDR -j CT --notrack 2>/dev/null
     return 0
 }
 
 # insmod loads exactly the file it is given and resolves nothing, so every
-# symbol xt_NAT imports has to already be in the kernel. xt_register_target()
+# symbol xt_CGNAT imports has to already be in the kernel. xt_register_target()
 # lives in x_tables, which on a freshly booted machine nothing has loaded yet -
 # the first insmod then fails with "Unknown symbol in module". It works on a
 # desktop only because something else pulled x_tables in first. The test rules
-# need the rest. (modprobe xt_NAT after make install/depmod handles this by
+# need the rest. (modprobe xt_CGNAT after make install/depmod handles this by
 # itself; insmod of a build-directory .ko does not.)
 preload_deps() {
     local m
@@ -127,10 +127,10 @@ preload_deps() {
 }
 
 mod_up()        { insmod "$MODULE" nat_pool=$POOL_START-$POOL_END "$@"; }
-mod_down()      { rmmod xt_NAT 2>/dev/null; return 0; }
-module_loaded() { [ -d /proc/net/NAT ]; }
+mod_down()      { rmmod xt_CGNAT 2>/dev/null; return 0; }
+module_loaded() { [ -d /proc/net/CGNAT ]; }
 
 nat_stat() {
     # nat_stat "Active NAT sessions" -> number
-    sed -n "s/^$1: *//p" /proc/net/NAT/statistics 2>/dev/null | head -1
+    sed -n "s/^$1: *//p" /proc/net/CGNAT/statistics 2>/dev/null | head -1
 }

@@ -48,7 +48,7 @@
 set -u
 
 SRCDIR=$(cd "$(dirname "$0")" && pwd)
-CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/xt_NAT-vm
+CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/xt_CGNAT-vm
 RESULTS=$SRCDIR/vm-results
 RUNDIR=""
 
@@ -107,7 +107,7 @@ CONFIG_IP_NF_FILTER=y
 CONFIG_NF_DEFRAG_IPV4=y
 CONFIG_PACKET=y
 # iptables on a current distro is the nft backend, which reaches xt targets
-# through nft_compat - without these, "iptables -j NAT" cannot load the target
+# through nft_compat - without these, "iptables -j CGNAT" cannot load the target
 CONFIG_NF_TABLES=y
 CONFIG_NF_TABLES_INET=y
 CONFIG_NFT_COMPAT=y
@@ -308,18 +308,18 @@ cp -a "$SHARE"/src/. /root/src/
 cd /root/src || fatal "no source"
 
 if [ "${BUILD_MODULE_IN_GUEST:-0}" = 1 ]; then
-    echo "### building xt_NAT.ko against $(uname -r)"
+    echo "### building xt_CGNAT.ko against $(uname -r)"
     make -C "/lib/modules/$(uname -r)/build" M=/root/src modules \
         || fatal "module build failed"
 else
-    echo "### using xt_NAT.ko built on the host"
-    [ -f /root/src/xt_NAT.ko ] || fatal "no prebuilt xt_NAT.ko in the share"
+    echo "### using xt_CGNAT.ko built on the host"
+    [ -f /root/src/xt_CGNAT.ko ] || fatal "no prebuilt xt_CGNAT.ko in the share"
 fi
 
-echo "### building libxt_NAT.so"
-make libxt_NAT.so || fatal "userspace extension build failed"
+echo "### building libxt_CGNAT.so"
+make libxt_CGNAT.so || fatal "userspace extension build failed"
 
-modinfo /root/src/xt_NAT.ko | sed -n '1,6p'
+modinfo /root/src/xt_CGNAT.ko | sed -n '1,6p'
 
 {
     echo "kernel=$(uname -r)"
@@ -327,7 +327,7 @@ modinfo /root/src/xt_NAT.ko | sed -n '1,6p'
     echo "vcpus=$(nproc)"
     echo "memory_mb=$(( $(awk '/MemTotal/{print $2}' /proc/meminfo) / 1024 ))"
     echo "gcc=$(gcc --version 2>/dev/null | head -1)"
-    echo "vermagic=$(modinfo -F vermagic /root/src/xt_NAT.ko 2>/dev/null)"
+    echo "vermagic=$(modinfo -F vermagic /root/src/xt_CGNAT.ko 2>/dev/null)"
     dbg=""
     cfg="/boot/config-$(uname -r)"; rd=cat
     [ -r /proc/config.gz ] && { cfg=/proc/config.gz; rd=zcat; }
@@ -344,14 +344,14 @@ rc=0
 
 if [ "${RUN_TESTS:-1}" = 1 ]; then
     echo "### running qemu-tests.sh ${TEST_ARGS:-}"
-    MODULE=/root/src/xt_NAT.ko /root/src/qemu-tests.sh ${TEST_ARGS:-} 2>&1 | tee "$ART/tests.txt"
+    MODULE=/root/src/xt_CGNAT.ko /root/src/qemu-tests.sh ${TEST_ARGS:-} 2>&1 | tee "$ART/tests.txt"
     rc=${PIPESTATUS[0]}
     echo "### qemu-tests.sh exited $rc"
 fi
 
 if [ "${RUN_BENCH:-0}" = 1 ]; then
     echo "### running bench-cps.sh ${BENCH_ARGS:-}"
-    MODULE=/root/src/xt_NAT.ko /root/src/bench-cps.sh ${BENCH_ARGS:-} 2>&1 | tee "$ART/bench.txt"
+    MODULE=/root/src/xt_CGNAT.ko /root/src/bench-cps.sh ${BENCH_ARGS:-} 2>&1 | tee "$ART/bench.txt"
     brc=${PIPESTATUS[0]}
     echo "### bench-cps.sh exited $brc"
     [ "$rc" = 0 ] && rc=$brc
@@ -359,7 +359,7 @@ fi
 
 echo $rc > "$ART/exit-code"
 
-cp /root/src/xt_NAT.ko "$ART/" 2>/dev/null
+cp /root/src/xt_CGNAT.ko "$ART/" 2>/dev/null
 finish
 GUEST
 chmod +x "$RUNDIR/share/guest-run.sh"
@@ -421,7 +421,7 @@ write_report() {
     [ -f "$A/dmesg.txt" ] && splats=$(grep -cE '\bBUG:|KASAN|UBSAN|WARNING:|INFO: possible|suspicious RCU|refcount_t|use-after-free' "$A/dmesg.txt")
 
     {
-        echo "# xt_NAT VM test report"
+        echo "# xt_CGNAT VM test report"
         echo
         echo "Result: **$([ "$rc" = 0 ] && echo PASS || echo "FAIL (exit $rc)")**"
         echo
@@ -497,7 +497,7 @@ write_report() {
             echo "Clean - no BUG, KASAN, lockdep or RCU reports."
         fi
         echo
-        echo "Module load/unload cycles: $(grep -c 'Module xt_NAT loaded' "$A/dmesg.txt" 2>/dev/null || echo 0)"
+        echo "Module load/unload cycles: $(grep -c 'Module xt_CGNAT loaded' "$A/dmesg.txt" 2>/dev/null || echo 0)"
         echo
 
         echo "## Artifacts"
@@ -525,7 +525,7 @@ write_report() {
 
 # -------------------------------------------------------------------- main ---
 
-step "xt_NAT VM test run"
+step "xt_CGNAT VM test run"
 
 fetch_image
 
@@ -551,10 +551,10 @@ cp "$SRCDIR"/*.c "$SRCDIR"/*.h "$SRCDIR/Makefile" \
 BUILD_IN_GUEST=1
 if [ -n "$KDIR" ]; then
     BUILD_IN_GUEST=0
-    step "building xt_NAT.ko on the host against $KDIR"
+    step "building xt_CGNAT.ko on the host against $KDIR"
     make -C "$KDIR" M="$SRCDIR" modules >/dev/null || die "host module build failed"
-    cp "$SRCDIR/xt_NAT.ko" "$RUNDIR/share/src/" || die "no xt_NAT.ko produced"
-    say "$(modinfo "$SRCDIR/xt_NAT.ko" | sed -n 's/^vermagic: */vermagic: /p')"
+    cp "$SRCDIR/xt_CGNAT.ko" "$RUNDIR/share/src/" || die "no xt_CGNAT.ko produced"
+    say "$(modinfo "$SRCDIR/xt_CGNAT.ko" | sed -n 's/^vermagic: */vermagic: /p')"
 fi
 
 write_guest_runner

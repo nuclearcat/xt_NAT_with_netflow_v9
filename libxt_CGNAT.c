@@ -4,7 +4,7 @@
 
 #include <xtables.h>
 #include <linux/netfilter/x_tables.h>
-#include "xt_NAT.h"
+#include "xt_CGNAT.h"
 
 enum {
     F_SNAT  = 1 << 0,
@@ -20,23 +20,23 @@ static const struct option nat_tg_opts[] = {
 static void nat_tg_help(void)
 {
     printf(
-        "NAT target options:\n"
-        "  --snat    Create NAT translation from Inside to Outside\n"
-        "  --dnat    Allow NAT for revert traffic from Outside to Inside\n");
+        "CGNAT target options:\n"
+        "  --snat    Create CGNAT translation from Inside to Outside\n"
+        "  --dnat    Allow CGNAT for revert traffic from Outside to Inside\n");
 }
 
 static int nat_tg_parse(int c, char **argv, int invert, unsigned int *flags,
                         const void *entry, struct xt_entry_target **target)
 {
-    struct xt_nat_tginfo *info = (void *)(*target)->data;
+    struct xt_cgnat_tginfo *info = (void *)(*target)->data;
 
     switch (c) {
     case 's':
-        info->variant = XTNAT_SNAT;
+        info->variant = XT_CGNAT_SNAT;
         *flags |= F_SNAT;
         return true;
     case 'd':
-        info->variant = XTNAT_DNAT;
+        info->variant = XT_CGNAT_DNAT;
         *flags |= F_DNAT;
         return true;
     }
@@ -47,22 +47,22 @@ static void nat_tg_check(unsigned int flags)
 {
     if (flags == (F_SNAT | F_DNAT))
         xtables_error(PARAMETER_PROBLEM,
-                      "NAT: only one action can be used at a time");
+                      "CGNAT: only one action can be used at a time");
     if (flags == 0)
         xtables_error(PARAMETER_PROBLEM,
-                      "NAT: --snat or --dnat is required");
+                      "CGNAT: --snat or --dnat is required");
 }
 
 static void nat_tg_save(const void *ip,
                         const struct xt_entry_target *target)
 {
-    const struct xt_nat_tginfo *info = (const void *)target->data;
+    const struct xt_cgnat_tginfo *info = (const void *)target->data;
 
     switch (info->variant) {
-    case XTNAT_SNAT:
+    case XT_CGNAT_SNAT:
         printf(" --snat ");
         break;
-    case XTNAT_DNAT:
+    case XT_CGNAT_DNAT:
         printf(" --dnat ");
         break;
     }
@@ -71,16 +71,16 @@ static void nat_tg_save(const void *ip,
 static void nat_tg_print(const void *ip,
                          const struct xt_entry_target *target, int numeric)
 {
-    printf(" -j NAT");
+    printf(" -j CGNAT");
     nat_tg_save(ip, target);
 }
 
 static struct xtables_target nat_tg_reg = {
     .version       = XTABLES_VERSION,
-    .name          = "NAT",
+    .name          = "CGNAT",
     .family        = NFPROTO_IPV4,
-    .size          = XT_ALIGN(sizeof(struct xt_nat_tginfo)),
-    .userspacesize = XT_ALIGN(sizeof(struct xt_nat_tginfo)),
+    .size          = XT_ALIGN(sizeof(struct xt_cgnat_tginfo)),
+    .userspacesize = XT_ALIGN(sizeof(struct xt_cgnat_tginfo)),
     .help          = nat_tg_help,
     .parse         = nat_tg_parse,
     .final_check   = nat_tg_check,

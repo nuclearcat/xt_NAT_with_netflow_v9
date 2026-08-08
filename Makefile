@@ -2,28 +2,28 @@ KVER   ?= $(shell uname -r)
 KDIR   ?= /lib/modules/$(KVER)/build/
 DEPMOD  = /sbin/depmod -a
 CC     ?= gcc
-obj-m   = xt_NAT.o
-CFLAGS_xt_NAT.o := -DDEBUG
+obj-m   = xt_CGNAT.o
+CFLAGS_xt_CGNAT.o := -DDEBUG
 
-all: xt_NAT.ko libxt_NAT.so
+all: xt_CGNAT.ko libxt_CGNAT.so
 
-xt_NAT.ko: xt_NAT.c
+xt_CGNAT.ko: xt_CGNAT.c
 	# To force DWARF/debug info for the module, append CONFIG_DEBUG_INFO=y to this make invocation.
 	make -C $(KDIR) M=$(CURDIR) modules
 	-sync
 
-%_sh.o: libxt_NAT.c
+%_sh.o: libxt_CGNAT.c
 	gcc -O2 -Wall -Wunused -fPIC -o $@ -c $<
 
 %.so: %_sh.o
 	gcc -shared -o $@ $<
 
-sparse: clean | xt_NAT.c xt_NAT.h
+sparse: clean | xt_CGNAT.c xt_CGNAT.h
 	make -C $(KDIR) M=$(CURDIR) modules C=1
 
 cppcheck:
-	cppcheck -I $(KDIR)/include --enable=all --inconclusive xt_NAT.c
-	cppcheck libxt_NAT.c
+	cppcheck -I $(KDIR)/include --enable=all --inconclusive xt_CGNAT.c
+	cppcheck libxt_CGNAT.c
 
 coverity:
 	coverity-submit -v
@@ -34,28 +34,28 @@ clean:
 
 install: | minstall linstall
 
-minstall: | xt_NAT.ko
+minstall: | xt_CGNAT.ko
 	make -C $(KDIR) M=$(CURDIR) modules_install INSTALL_MOD_PATH=$(DESTDIR)
 
-linstall: libxt_NAT.so
+linstall: libxt_CGNAT.so
 	install -D $< $(DESTDIR)$(shell pkg-config --variable xtlibdir xtables)/$<
 
 uninstall:
-	-rm -f $(DESTDIR)$(shell pkg-config --variable xtlibdir xtables)/libxt_NAT.so
-	-rm -f $(KDIR)/extra/xt_NAT.ko
+	-rm -f $(DESTDIR)$(shell pkg-config --variable xtlibdir xtables)/libxt_CGNAT.so
+	-rm -f $(KDIR)/extra/xt_CGNAT.ko
 
 load: all
 	-sync
 	-modprobe x_tables
 	-mkdir -p /lib64/modules/`uname -r`/kernel/net/ipv4/
-	-cp xt_NAT.ko /lib64/modules/`uname -r`/kernel/net/ipv4/
+	-cp xt_CGNAT.ko /lib64/modules/`uname -r`/kernel/net/ipv4/
 	-depmod `uname -r`
-	-modprobe xt_NAT
+	-modprobe xt_CGNAT
 	-iptables-restore < iptables.rules
 	-conntrack -F
 unload:
 	-/etc/init.d/iptables restart
-	-rmmod xt_NAT.ko
+	-rmmod xt_CGNAT.ko
 del:
 	-sync
 reload: unload clean load

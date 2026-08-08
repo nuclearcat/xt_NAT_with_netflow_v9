@@ -1,12 +1,12 @@
 #!/bin/bash
 #
-# qemu-tests.sh - functional and regression tests for the xt_NAT module.
+# qemu-tests.sh - functional and regression tests for the xt_CGNAT module.
 #
 # Runs a NAT topology entirely inside one machine using network namespaces:
 #
 #      netns xtnat-sub                root netns (DUT)              netns xtnat-inet
 #   10.0.0.2 --- xn-s1 <=> xn-s0 10.0.0.1 | 198.51.100.1 xn-i0 <=> xn-i1 --- 198.51.100.2
-#                                    xt_NAT, pool 203.0.113.1-4
+#                                    xt_CGNAT, pool 203.0.113.1-4
 #
 # Meant to be run as root in a throwaway VM. It insmods an out-of-tree NAT
 # module and rewrites the root namespace's iptables rules, so it refuses to
@@ -22,7 +22,7 @@
 # the value is. A test that "passes" on a kernel without KASAN has proved much
 # less than the same test on one with it.
 #
-# Build the module and libxt_NAT.so against the kernel you are going to boot,
+# Build the module and libxt_CGNAT.so against the kernel you are going to boot,
 # then run this inside it. Note that it sets the FORWARD policy to ACCEPT and
 # does not put it back.
 #
@@ -34,14 +34,14 @@
 #                                   (re)launch itself under virtme-ng
 #
 # Environment:
-#   MODULE=/path/to/xt_NAT.ko       default ./xt_NAT.ko
+#   MODULE=/path/to/xt_CGNAT.ko       default ./xt_CGNAT.ko
 #   XT_NAT_TEST_FORCE=1             allow running on non-virtualised hosts
 #
 
 set -u
 
 SRCDIR=$(cd "$(dirname "$0")" && pwd)
-MODULE=${MODULE:-$SRCDIR/xt_NAT.ko}
+MODULE=${MODULE:-$SRCDIR/xt_CGNAT.ko}
 
 . "$SRCDIR/testnet.sh"
 
@@ -85,7 +85,7 @@ dmesg_mark() { DMESG_MARK=$(dmesg 2>/dev/null | wc -l); }
 # Anything here means the kernel is unhappy. "bad use value" and "session count
 # underflow" are the module's own consistency complaints and count too.
 #
-# \b matters on the first two: the module prints "xt_NAT DEBUG:" and
+# \b matters on the first two: the module prints "xt_CGNAT DEBUG:" and
 # "... ERROR: ..." constantly, and an unanchored BUG: matches every DEBUG:
 # line, which turned every ordinary load into a fake splat.
 DMESG_BAD=(
@@ -143,7 +143,7 @@ check_env() {
     fi
 
     if ! xtables_libdir_setup; then
-        say "libxt_NAT.so not found in $SRCDIR or the system xtables dir - run 'make' first"
+        say "libxt_CGNAT.so not found in $SRCDIR or the system xtables dir - run 'make' first"
         exit 1
     fi
 }
@@ -346,7 +346,7 @@ t_load() {
         return
     fi
     for f in sessions users statistics; do
-        [ -r /proc/net/NAT/$f ] || { fail "$n" "/proc/net/NAT/$f missing"; return; }
+        [ -r /proc/net/CGNAT/$f ] || { fail "$n" "/proc/net/CGNAT/$f missing"; return; }
     done
     dmesg_check "$n" && pass "$n"
 }
@@ -398,8 +398,8 @@ t_tables() {
     local sess users act
     # both files end with their own total; do not count '->' lines, the
     # sessions header contains one
-    sess=$(sed -n 's/^Total translations: *//p' /proc/net/NAT/sessions 2>/dev/null)
-    users=$(sed -n 's/^Total users: *//p' /proc/net/NAT/users 2>/dev/null)
+    sess=$(sed -n 's/^Total translations: *//p' /proc/net/CGNAT/sessions 2>/dev/null)
+    users=$(sed -n 's/^Total users: *//p' /proc/net/CGNAT/users 2>/dev/null)
     act=$(nat_stat "Active NAT sessions")
     if [ "${sess:-0}" -gt 0 ] && [ "${users:-0}" -gt 0 ]; then
         dmesg_check "$n" && pass "$n" && info "$sess sessions, $users users, active=$act"
@@ -441,13 +441,13 @@ t_icmp_malformed() {
 t_target_validation() {
     local n="rule without --snat/--dnat is rejected"
     dmesg_mark
-    if ipt -A FORWARD -s $SUB_CIDR -j NAT 2>/dev/null; then
-        ipt -D FORWARD -s $SUB_CIDR -j NAT 2>/dev/null
+    if ipt -A FORWARD -s $SUB_CIDR -j CGNAT 2>/dev/null; then
+        ipt -D FORWARD -s $SUB_CIDR -j CGNAT 2>/dev/null
         fail "$n" "iptables accepted a NAT rule with no direction"
         return
     fi
-    if ipt -A FORWARD -s $SUB_CIDR -j NAT --snat --dnat 2>/dev/null; then
-        ipt -D FORWARD -s $SUB_CIDR -j NAT --snat --dnat 2>/dev/null
+    if ipt -A FORWARD -s $SUB_CIDR -j CGNAT --snat --dnat 2>/dev/null; then
+        ipt -D FORWARD -s $SUB_CIDR -j CGNAT --snat --dnat 2>/dev/null
         fail "$n" "iptables accepted --snat --dnat together"
         return
     fi
@@ -463,7 +463,7 @@ t_bad_params() {
 
     # a reversed/empty pool must be refused
     if insmod "$MODULE" nat_pool=0.0.0.0-0.0.0.0 2>/dev/null; then
-        rmmod xt_NAT 2>/dev/null
+        rmmod xt_CGNAT 2>/dev/null
         fail "$n" "an empty NAT pool was accepted"
         mod_up; rules_up; return
     fi
@@ -473,7 +473,7 @@ t_bad_params() {
     local bad
     for bad in "nat_hash_size=0" "nat_hash_size=-1" "users_hash_size=0"; do
         if insmod "$MODULE" nat_pool=$POOL_START-$POOL_END $bad 2>/dev/null; then
-            rmmod xt_NAT 2>/dev/null
+            rmmod xt_CGNAT 2>/dev/null
             fail "$n" "$bad was accepted"
             mod_up; rules_up; return
         fi
@@ -527,10 +527,10 @@ t_reload_cycles() {
         sleep 6
         echo scan > /sys/kernel/debug/kmemleak
         local leaks
-        leaks=$(grep -c 'xt_NAT\|nat_htable\|nat_tg_init' /sys/kernel/debug/kmemleak 2>/dev/null)
+        leaks=$(grep -c 'xt_CGNAT\|nat_htable\|nat_tg_init' /sys/kernel/debug/kmemleak 2>/dev/null)
         if [ "${leaks:-0}" -gt 0 ]; then
-            fail "$n" "kmemleak reports $leaks xt_NAT allocations"
-            grep -A3 'xt_NAT' /sys/kernel/debug/kmemleak 2>/dev/null | head -20 | sed 's/^/     | /'
+            fail "$n" "kmemleak reports $leaks xt_CGNAT allocations"
+            grep -A3 'xt_CGNAT' /sys/kernel/debug/kmemleak 2>/dev/null | head -20 | sed 's/^/     | /'
             return
         fi
         info "kmemleak: clean"
@@ -550,7 +550,7 @@ t_rmmod_under_load() {
     local fl=$!
     sleep 2
     rules_down
-    timeout 30 rmmod xt_NAT 2>"$TMPD/err"
+    timeout 30 rmmod xt_CGNAT 2>"$TMPD/err"
     local rc=$?
     kill $fl 2>/dev/null; wait $fl 2>/dev/null
     case $rc in
@@ -606,7 +606,7 @@ t_aging() {
 
 t_final_stats() {
     head_ "counters"
-    cat /proc/net/NAT/statistics 2>/dev/null | sed 's/^/     /'
+    cat /proc/net/CGNAT/statistics 2>/dev/null | sed 's/^/     /'
     local tried created
     tried=$(nat_stat "Tried NAT sessions")
     created=$(nat_stat "Created NAT sessions")
@@ -645,7 +645,7 @@ fi
 check_env
 trap cleanup EXIT INT TERM
 
-head_ "xt_NAT test run: $(uname -r)"
+head_ "xt_CGNAT test run: $(uname -r)"
 info "module: $MODULE"
 report_kernel_config
 

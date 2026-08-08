@@ -37,7 +37,7 @@
 set -u
 
 SRCDIR=$(cd "$(dirname "$0")" && pwd)
-MODULE=${MODULE:-$SRCDIR/xt_NAT.ko}
+MODULE=${MODULE:-$SRCDIR/xt_CGNAT.ko}
 
 . "$SRCDIR/testnet.sh"
 
@@ -89,7 +89,7 @@ if [ "${XT_NAT_TEST_FORCE:-0}" != 1 ]; then
         die "not a VM; this floods a live kernel. XT_NAT_TEST_FORCE=1 to override"
     fi
 fi
-xtables_libdir_setup || die "libxt_NAT.so not found - run 'make' first"
+xtables_libdir_setup || die "libxt_CGNAT.so not found - run 'make' first"
 
 [ "$SENDERS" -gt 0 ] 2>/dev/null || {
     SENDERS=$(nproc 2>/dev/null || echo 2)
@@ -248,7 +248,7 @@ gc_cost() {
     printf '%12s %14s\n' "${act:-0}" "${pct}%"
 }
 
-head_ "xt_NAT session setup rate"
+head_ "xt_CGNAT session setup rate"
 info "kernel:    $(uname -r)"
 info "senders:   $SENDERS x ${DURATION}s, $N_SRC_IPS source addresses"
 info "module:    $MODULE"
@@ -306,17 +306,17 @@ else
     # assume it.
     head_ "port allocation invariant"
     local total dups
-    total=$(awk '$1 ~ /^[0-9]+$/ && /->/ {n++} END{print n+0}' /proc/net/NAT/sessions 2>/dev/null)
-    dups=$(awk '$1 ~ /^[0-9]+$/ && /->/ {print $1, $4}' /proc/net/NAT/sessions 2>/dev/null \
+    total=$(awk '$1 ~ /^[0-9]+$/ && /->/ {n++} END{print n+0}' /proc/net/CGNAT/sessions 2>/dev/null)
+    dups=$(awk '$1 ~ /^[0-9]+$/ && /->/ {print $1, $4}' /proc/net/CGNAT/sessions 2>/dev/null \
            | sort | uniq -d | wc -l)
     say "     sessions listed:            $total"
     say "     duplicate (proto,nat:port): $dups"
     if [ "${dups:-0}" -gt 0 ]; then
         say "     ${C_R}COLLISION: the same NAT port is mapped to more than one session${C_0}"
-        awk '$1 ~ /^[0-9]+$/ && /->/ {print $1, $4}' /proc/net/NAT/sessions | sort | uniq -d | head -3 \
+        awk '$1 ~ /^[0-9]+$/ && /->/ {print $1, $4}' /proc/net/CGNAT/sessions | sort | uniq -d | head -3 \
             | while read -r p np; do
                 say "       proto $p $np used by:"
-                awk -v p="$p" -v np="$np" '$1==p && $4==np {print "         " $0}' /proc/net/NAT/sessions | head -3
+                awk -v p="$p" -v np="$np" '$1==p && $4==np {print "         " $0}' /proc/net/CGNAT/sessions | head -3
               done
     fi
 
@@ -337,11 +337,11 @@ else
                 n++
             }
             END { printf "     %d sessions checked, %d outside their computed block\n", n, bad+0 }
-        ' /proc/net/NAT/sessions 2>/dev/null
+        ' /proc/net/CGNAT/sessions 2>/dev/null
     fi
 
     head_ "counters after the run"
-    sed 's/^/     /' /proc/net/NAT/statistics 2>/dev/null
+    sed 's/^/     /' /proc/net/CGNAT/statistics 2>/dev/null
 
     head_ "reading it"
     if [ "${LAST_D[3]:-0}" -gt 0 ]; then

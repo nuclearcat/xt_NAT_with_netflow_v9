@@ -1,4 +1,4 @@
-# Testing and benchmarking xt_NAT
+# Testing and benchmarking xt_CGNAT
 
 Everything here runs in a throwaway VM. Nothing needs to touch the machine you
 are working on, and it should not: a bug in this module is a kernel bug.
@@ -56,7 +56,7 @@ things without which the rig cannot run at all:
   the legacy tables behind a new gate; without them there is no raw table for
   `-j CT --notrack`.
 - `NF_TABLES` + `NFT_COMPAT`. A current distro's iptables is the nft backend and
-  reaches xt targets through `nft_compat`; without these `-j NAT` cannot load.
+  reaches xt targets through `nft_compat`; without these `-j CGNAT` cannot load.
 - `IKCONFIG_PROC`, so the guest can report which debug options it has.
 - 9p, veth, namespaces, virtio.
 
@@ -97,7 +97,7 @@ long time with no NetFlow collector configured, so the export path was never
 exercised and the numbers carried an unstated caveat. `--netflow` counts the
 datagrams that arrive, because an export that silently failed would look exactly
 like an export that costs nothing. Likewise, KASAN being enabled was confirmed
-by `nm xt_NAT.ko | grep __asan` rather than assumed.
+by `nm xt_CGNAT.ko | grep __asan` rather than assumed.
 
 **Make the arithmetic reconcile before concluding.** Sessions listed exceeded
 the port capacity, which looked like the allocator handing out duplicates —
