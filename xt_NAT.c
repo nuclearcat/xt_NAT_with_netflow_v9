@@ -24,6 +24,11 @@
 #define TCP_SYN_ACK 0x12
 #define TCP_FIN_RST 0x05
 
+/* the GC timers walk 1/100th and 1/60th of the tables per tick, so a table
+ * smaller than that has slices of zero buckets and never ages anything out */
+#define NAT_HASH_MIN 1024
+#define NAT_HASH_MAX (1 << 24)
+
 static LIST_HEAD(usock_list);
 static int sndbuf = 1310720;
 static int flowsetID = 300;
@@ -1649,6 +1654,22 @@ static int __init nat_tg_init(void)
         printk(KERN_INFO "xt_NAT DEBUG: IP Pool from %pI4 to %pI4\n", &nat_pool_start, &nat_pool_end);
     } else {
         printk(KERN_INFO "xt_NAT DEBUG: BAD IP Pool from %pI4 to %pI4\n", &nat_pool_start, &nat_pool_end);
+        return -EINVAL;
+    }
+
+    /* Both are used as the divisor in reciprocal_scale() and are sliced by
+     * the GC timers (/100 and /60), so zero or negative is not merely odd -
+     * kzalloc(0) hands back ZERO_SIZE_PTR, which is not NULL, so the
+     * allocation check passes and the first packet dereferences it.
+     */
+    if (nat_hash_size < NAT_HASH_MIN || nat_hash_size > NAT_HASH_MAX) {
+        printk(KERN_ERR "xt_NAT: nat_hash_size must be between %d and %d\n",
+               NAT_HASH_MIN, NAT_HASH_MAX);
+        return -EINVAL;
+    }
+    if (users_hash_size < NAT_HASH_MIN || users_hash_size > NAT_HASH_MAX) {
+        printk(KERN_ERR "xt_NAT: users_hash_size must be between %d and %d\n",
+               NAT_HASH_MIN, NAT_HASH_MAX);
         return -EINVAL;
     }
 
