@@ -15,6 +15,7 @@
 #   ./bench-cps.sh --duration 20
 #   ./bench-cps.sh --senders 4         one generator process per core
 #   ./bench-cps.sh --pool-sweep        1, 2, 4, 8, 16 NAT addresses
+#   ./bench-cps.sh --gc-cost           what the GC costs at rest, vs table size
 #
 # READ THIS BEFORE QUOTING A NUMBER. In a VM, over veth, this measures a
 # software path on a virtual CPU. The absolute figure is meaningless as a
@@ -39,6 +40,7 @@ DURATION=10
 SENDERS=0            # 0 = one per online cpu, capped at 4
 N_SRC_IPS=2000
 SWEEP=0
+GCCOST=0
 KEEP=0
 
 if [ -t 1 ]; then
@@ -59,6 +61,7 @@ while [ $# -gt 0 ]; do
         --senders)  shift; SENDERS=${1:-0} ;;
         --src-ips)  shift; N_SRC_IPS=${1:-2000} ;;
         --pool-sweep) SWEEP=1 ;;
+        --gc-cost)    GCCOST=1 ;;
         --keep)     KEEP=1 ;;
         -h|--help)  usage ;;
         *) die "unknown option: $1" ;;
@@ -164,6 +167,34 @@ run_once() {
     return 0
 }
 
+# user+nice+system+irq+softirq, in USER_HZ
+cpu_busy() { awk '/^cpu /{print $2+$3+$4+$7+$8}' /proc/stat; }
+
+# Fill the table, stop, and see what the box still burns doing nothing. With no
+# traffic the only work left is the cleanup timers, so this is the GC's cost as
+# a function of how much it has to sweep.
+gc_cost() {
+    local fill=$1 window=10 b0 b1 act pct dmac gen="$TMPD/cps-gen"
+
+    if [ "$fill" -gt 0 ]; then
+        dmac=$(ip link show xn-s0 | awk '/link\/ether/{print $2}')
+        local i pids=()
+        for i in $(seq 0 $((SENDERS - 1))); do
+            ip netns exec $NS_SUB "$gen" xn-s1 "$dmac" \
+                "$(ip_from_int $(( SRC_BASE + i * 500 )))" 500 \
+                "$INET_NET.3" "$fill" >/dev/null 2>&1 &
+            pids+=($!)
+        done
+        for i in "${pids[@]}"; do wait "$i"; done
+    fi
+
+    sleep 2                       # let the last packets drain
+    act=$(nat_stat "Active NAT sessions")
+    b0=$(cpu_busy); sleep $window; b1=$(cpu_busy)
+    pct=$(awk -v a="$b0" -v b="$b1" -v w="$window" 'BEGIN{printf "%.1f", (b-a)/100/w*100}')
+    printf '%12s %14s\n' "${act:-0}" "${pct}%"
+}
+
 head_ "xt_NAT session setup rate"
 info "kernel:    $(uname -r)"
 info "senders:   $SENDERS x ${DURATION}s, $N_SRC_IPS source addresses"
@@ -173,7 +204,23 @@ say ""
 say "compiling generator"
 gcc -O2 -o "$GEN" "$SRCDIR/cps-gen.c" || die "could not build cps-gen.c"
 
-if [ $SWEEP = 1 ]; then
+if [ $GCCOST = 1 ]; then
+    head_ "GC cost at rest"
+    say "Sessions are filled, then all traffic stops. Whatever CPU is still"
+    say "being burned is the cleanup timers sweeping the table."
+    say ""
+    POOL_START=203.0.113.1
+    POOL_END=203.0.113.16
+    preload_deps; rules_down; mod_down; net_down; sleep 0.2
+    net_up; mod_up user_max_sessions=65535 || die "insmod failed"; rules_up
+    gcc -O2 -o "$TMPD/cps-gen" "$SRCDIR/cps-gen.c" || die "cps-gen build failed"
+    printf '%12s %14s\n' "sessions" "cpu (1 core)"
+    printf '%12s %14s\n' "--------" "------------"
+    for f in 0 2 8 20; do gc_cost $f; done
+    say ""
+    say "The sweep visits every bucket every ~10s and writes to every session,"
+    say "whether or not anything expired."
+elif [ $SWEEP = 1 ]; then
     head_ "pool size sweep"
     say "create_session_lock[] is one spinlock per NAT address, so the pool size"
     say "bounds how much session creation can happen in parallel."
