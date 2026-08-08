@@ -256,6 +256,21 @@ rules_down() {
     return 0
 }
 
+# insmod loads exactly the file it is given and resolves nothing, so every
+# symbol xt_NAT imports has to already be in the kernel. xt_register_target()
+# lives in x_tables, which on a freshly booted machine nothing has loaded yet -
+# the first insmod then fails with "Unknown symbol in module". It works on a
+# desktop only because something else pulled x_tables in first. The test rules
+# need the rest. (modprobe xt_NAT after make install/depmod handles this by
+# itself; insmod of a build-directory .ko does not.)
+preload_deps() {
+    local m
+    for m in x_tables ip_tables iptable_raw iptable_filter nf_conntrack xt_CT; do
+        modprobe $m 2>/dev/null
+    done
+    return 0
+}
+
 mod_up()       { insmod "$MODULE" nat_pool=$POOL_START-$POOL_END "$@"; }
 mod_down()     { rmmod xt_NAT 2>/dev/null; return 0; }
 module_loaded() { [ -d /proc/net/NAT ]; }
@@ -433,8 +448,12 @@ srv_stop() {
 
 t_load() {
     local n="module loads and exports /proc"
+    preload_deps
     dmesg_mark
-    if ! mod_up; then fail "$n" "insmod failed"; return; fi
+    if ! mod_up 2>"$TMPD/err"; then
+        fail "$n" "insmod failed: $(head -1 "$TMPD/err")"
+        return
+    fi
     for f in sessions users statistics; do
         [ -r /proc/net/NAT/$f ] || { fail "$n" "/proc/net/NAT/$f missing"; return; }
     done
