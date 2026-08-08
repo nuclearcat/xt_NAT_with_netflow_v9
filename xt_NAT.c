@@ -12,6 +12,7 @@
 #include <linux/netfilter/x_tables.h>
 #include <linux/inet.h>
 #include <linux/proc_fs.h>
+#include <linux/mm.h>
 #include <linux/refcount.h>
 #include <net/tcp.h>
 #include "compat.h"
@@ -194,14 +195,14 @@ get_hash_user_ent(const u_int32_t addr)
 
 static int pool_table_create(void)
 {
-    unsigned int sz; /* (bytes) */
+    size_t sz; /* (bytes) */
     unsigned int pool_size;
     int i;
 
     pool_size = get_pool_size();
 
-    sz = sizeof(spinlock_t) * pool_size;
-    create_session_lock = kzalloc(sz, GFP_KERNEL);
+    sz = sizeof(spinlock_t) * (size_t)pool_size;
+    create_session_lock = kvzalloc(sz, GFP_KERNEL);
 
     if (create_session_lock == NULL)
         return -ENOMEM;
@@ -210,14 +211,14 @@ static int pool_table_create(void)
         spin_lock_init(&create_session_lock[i]);
     }
 
-    printk(KERN_INFO "xt_NAT DEBUG: nat pool table mem: %d\n", sz);
+    printk(KERN_INFO "xt_NAT DEBUG: nat pool table mem: %zu\n", sz);
 
     return 0;
 }
 
 static void pool_table_remove(void)
 {
-    kfree(create_session_lock);
+    kvfree(create_session_lock);
     create_session_lock = NULL;
 
     printk(KERN_INFO "xt_NAT pool_table_remove DEBUG: removed\n");
@@ -226,11 +227,11 @@ static void pool_table_remove(void)
 
 static int users_htable_create(void)
 {
-    unsigned int sz; /* (bytes) */
+    size_t sz; /* (bytes) */
     int i;
 
-    sz = sizeof(struct xt_users_htable) * users_hash_size;
-    ht_users = kzalloc(sz, GFP_KERNEL);
+    sz = sizeof(struct xt_users_htable) * (size_t)users_hash_size;
+    ht_users = kvzalloc(sz, GFP_KERNEL);
 
     if (ht_users == NULL)
         return -ENOMEM;
@@ -241,7 +242,7 @@ static int users_htable_create(void)
         ht_users[i].use = 0;
     }
 
-    printk(KERN_INFO "xt_NAT DEBUG: users htable mem: %d\n", sz);
+    printk(KERN_INFO "xt_NAT DEBUG: users htable mem: %zu\n", sz);
     return 0;
 }
 
@@ -269,7 +270,7 @@ static void users_htable_remove(void)
         }
         spin_unlock_bh(&ht_users[i].lock);
     }
-    kfree(ht_users);
+    kvfree(ht_users);
     ht_users = NULL;
     printk(KERN_INFO "xt_NAT users_htable_remove DONE\n");
     return;
@@ -284,8 +285,8 @@ static void nat_htable_remove(void)
     unsigned int i;
 
     if (ht_inner == NULL || ht_outer == NULL) {
-        kfree(ht_inner);
-        kfree(ht_outer);
+        kvfree(ht_inner);
+        kvfree(ht_outer);
         ht_inner = NULL;
         ht_outer = NULL;
         return;
@@ -323,8 +324,8 @@ static void nat_htable_remove(void)
         spin_unlock_bh(&ht_outer[i].lock);
     }
 
-    kfree(ht_inner);
-    kfree(ht_outer);
+    kvfree(ht_inner);
+    kvfree(ht_outer);
     ht_inner = NULL;
     ht_outer = NULL;
 
@@ -335,11 +336,11 @@ static void nat_htable_remove(void)
 
 static int nat_htable_create(void)
 {
-    unsigned int sz; /* (bytes) */
+    size_t sz; /* (bytes) */
     int i;
 
-    sz = sizeof(struct xt_nat_htable) * nat_hash_size;
-    ht_inner = kzalloc(sz, GFP_KERNEL);
+    sz = sizeof(struct xt_nat_htable) * (size_t)nat_hash_size;
+    ht_inner = kvzalloc(sz, GFP_KERNEL);
     if (ht_inner == NULL)
         return -ENOMEM;
 
@@ -349,11 +350,11 @@ static int nat_htable_create(void)
         ht_inner[i].use = 0;
     }
 
-    printk(KERN_INFO "xt_NAT DEBUG: sessions htable inner mem: %d\n", sz);
+    printk(KERN_INFO "xt_NAT DEBUG: sessions htable inner mem: %zu\n", sz);
 
-    ht_outer = kzalloc(sz, GFP_KERNEL);
+    ht_outer = kvzalloc(sz, GFP_KERNEL);
     if (ht_outer == NULL) {
-        kfree(ht_inner);
+        kvfree(ht_inner);
         ht_inner = NULL;
         return -ENOMEM;
     }
@@ -364,7 +365,7 @@ static int nat_htable_create(void)
         ht_outer[i].use = 0;
     }
 
-    printk(KERN_INFO "xt_NAT DEBUG: sessions htable outer mem: %d\n", sz);
+    printk(KERN_INFO "xt_NAT DEBUG: sessions htable outer mem: %zu\n", sz);
     return 0;
 }
 
