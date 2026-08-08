@@ -11,6 +11,17 @@
 #   ./run-vm.sh --soak --keep
 #   ./run-vm.sh --shell                  drop to a guest shell instead
 #
+# What runs in the guest - the two stages are independent toggles:
+#
+#   --tests / --no-tests    qemu-tests.sh          (default: on)
+#   --bench / --no-bench    bench-cps.sh           (default: off)
+#   --soak                  adds the slow aging test to the suite
+#   --bench-args "..."      passed through to bench-cps.sh
+#   --bench-only            shorthand for --bench --no-tests
+#
+# Both stages run in one boot when both are on, and report.md covers whichever
+# ran. Turning both off is an error rather than a silent no-op boot.
+#
 # Two modes, and the difference matters:
 #
 #   default    Boots the image's own distro kernel. No KASAN, no lockdep -
@@ -51,6 +62,7 @@ MEMORY=4096
 TIMEOUT=1800
 KDIR=""
 KERNEL=""
+ROOTDEV=${ROOTDEV:-/dev/vda1}
 SOAK=0
 KEEP=0
 SHELL_MODE=0
@@ -82,13 +94,23 @@ CONFIG_VETH=y
 CONFIG_NETFILTER=y
 CONFIG_NETFILTER_ADVANCED=y
 CONFIG_NETFILTER_XTABLES=y
+CONFIG_NETFILTER_XTABLES_LEGACY=y
 CONFIG_NF_CONNTRACK=y
 CONFIG_NETFILTER_XT_TARGET_CT=y
 CONFIG_IP_NF_IPTABLES=y
+# 7.0 moved the legacy xtables tables behind IP_NF_IPTABLES_LEGACY; iptables-nft
+# does not need them, but enabling both means the rig works with either backend
+# (older kernels simply ignore the unknown symbol)
+CONFIG_IP_NF_IPTABLES_LEGACY=y
 CONFIG_IP_NF_RAW=y
 CONFIG_IP_NF_FILTER=y
 CONFIG_NF_DEFRAG_IPV4=y
 CONFIG_PACKET=y
+# iptables on a current distro is the nft backend, which reaches xt targets
+# through nft_compat - without these, "iptables -j NAT" cannot load the target
+CONFIG_NF_TABLES=y
+CONFIG_NF_TABLES_INET=y
+CONFIG_NFT_COMPAT=y
 # --- 9p, for getting the sources in and the results out ---
 CONFIG_NET_9P=y
 CONFIG_NET_9P_VIRTIO=y
@@ -101,6 +123,10 @@ CONFIG_VIRTIO_NET=y
 CONFIG_EXT4_FS=y
 CONFIG_SERIAL_8250=y
 CONFIG_SERIAL_8250_CONSOLE=y
+# --- so the guest can report which of these are actually on: a custom kernel
+# --- has no /boot/config-$(uname -r) in the cloud image's rootfs
+CONFIG_IKCONFIG=y
+CONFIG_IKCONFIG_PROC=y
 # --- the point of the exercise ---
 CONFIG_KASAN=y
 CONFIG_KASAN_GENERIC=y
@@ -118,7 +144,7 @@ CONFIG_SLUB_DEBUG=y
 CONFIG_DEBUG_KMEMLEAK=y
 CONFIG_DEBUG_KMEMLEAK_AUTO_SCAN=y
 CONFIG_LOCK_STAT=y
-CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y
+CONFIG_DEBUG_INFO_NONE=y
 EOF
 }
 
@@ -128,12 +154,16 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --kdir)    shift; KDIR=${1:-} ;;
         --kernel)  shift; KERNEL=${1:-} ;;
+        --rootdev) shift; ROOTDEV=${1:-/dev/vda1} ;;
         --image)   shift; IMAGE_URL=${1:-} ;;
         --cpus)    shift; CPUS=${1:-4} ;;
         --memory)  shift; MEMORY=${1:-4096} ;;
         --timeout) shift; TIMEOUT=${1:-1800} ;;
         --soak)    SOAK=1 ;;
-        --bench)   BENCH=1 ;;
+        --tests)      RUN_TESTS=1 ;;
+        --no-tests)   RUN_TESTS=0 ;;
+        --bench)      BENCH=1 ;;
+        --no-bench)   BENCH=0 ;;
         --bench-only) BENCH=1; RUN_TESTS=0 ;;
         --bench-args) shift; BENCH_ARGS=${1:-} ;;
         --keep)    KEEP=1 ;;
@@ -145,6 +175,13 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+
+if [ "$RUN_TESTS" = 0 ] && [ "$BENCH" = 0 ] && [ "$SHELL_MODE" = 0 ]; then
+    die "--no-tests without --bench leaves nothing to run"
+fi
+if [ "$SOAK" = 1 ] && [ "$RUN_TESTS" = 0 ]; then
+    die "--soak is part of the test suite, which --no-tests disables"
+fi
 
 # ------------------------------------------------------------ dependencies ---
 
@@ -171,6 +208,10 @@ fi
 if [ -n "$KDIR" ]; then
     [ -d "$KDIR" ] || die "--kdir: no such directory: $KDIR"
     [ -f "$KDIR/.config" ] || die "--kdir: $KDIR is not a configured kernel tree"
+    # An external module links against Module.symvers, which only the modules
+    # build produces. Without it modpost reports every kernel symbol as
+    # undefined, which looks like a code problem and is not one.
+    [ -f "$KDIR/Module.symvers" ] || die "--kdir: $KDIR has no Module.symvers - run 'make -j\$(nproc)' there (bzImage alone is not enough)"
     [ -n "$KERNEL" ] || KERNEL=$KDIR/arch/x86/boot/bzImage
 fi
 if [ -n "$KERNEL" ]; then
@@ -288,11 +329,14 @@ modinfo /root/src/xt_NAT.ko | sed -n '1,6p'
     echo "gcc=$(gcc --version 2>/dev/null | head -1)"
     echo "vermagic=$(modinfo -F vermagic /root/src/xt_NAT.ko 2>/dev/null)"
     dbg=""
+    cfg="/boot/config-$(uname -r)"; rd=cat
+    [ -r /proc/config.gz ] && { cfg=/proc/config.gz; rd=zcat; }
     for o in KASAN PROVE_LOCKING PROVE_RCU DEBUG_ATOMIC_SLEEP DEBUG_OBJECTS_TIMERS \
              DEBUG_KMEMLEAK SLUB_DEBUG DEBUG_LIST LOCK_STAT; do
-        grep -q "^CONFIG_$o=y" "/boot/config-$(uname -r)" 2>/dev/null && dbg="$dbg $o"
+        $rd "$cfg" 2>/dev/null | grep -q "^CONFIG_$o=y" && dbg="$dbg $o"
     done
-    echo "kernel_debug=${dbg:-none}"
+    [ -r "$cfg" ] || dbg=""
+    echo "kernel_debug=${dbg:-none (no readable kernel config)}"
 } > "$ART/env.txt"
 
 chmod +x /root/src/qemu-tests.sh /root/src/bench-cps.sh
@@ -551,8 +595,13 @@ fi
 
 if [ -n "$KERNEL" ]; then
     say "kernel: $KERNEL (direct boot)"
+    # root= must name a device the kernel can resolve on its own: there is no
+    # initramfs here, and a filesystem LABEL is resolved by userspace inside
+    # one, so root=LABEL=... panics with "unknown-block(0,0)". The cloud image
+    # lays out vda1 vda13 vda14 vda15, root being vda1. rootwait covers virtio
+    # probing finishing after the mount attempt.
     QEMU+=(-kernel "$KERNEL"
-           -append "root=LABEL=cloudimg-rootfs rw console=ttyS0 net.ifnames=0 kmemleak=on")
+           -append "root=$ROOTDEV rootwait rw console=ttyS0 net.ifnames=0 kmemleak=on")
 else
     warn "using the cloud image's own kernel: no KASAN, no lockdep."
     warn "for real coverage build a debug kernel and pass --kdir (see --help)."
