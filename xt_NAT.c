@@ -1999,6 +1999,26 @@ static int __init nat_tg_init(void)
     if (nat_pool_parse() < 0)
         return -EINVAL;
 
+    /* Both are used as the divisor in reciprocal_scale() and are sliced by
+     * the GC timers (/100 and /60), so zero or negative is not merely odd -
+     * kzalloc(0) hands back ZERO_SIZE_PTR, which is not NULL, so the
+     * allocation check passes and the first packet dereferences it.
+     */
+    if (nat_hash_size < NAT_HASH_MIN || nat_hash_size > NAT_HASH_MAX) {
+        printk(KERN_ERR "xt_NAT: nat_hash_size must be between %d and %d\n",
+               NAT_HASH_MIN, NAT_HASH_MAX);
+        return -EINVAL;
+    }
+    if (users_hash_size < NAT_HASH_MIN || users_hash_size > NAT_HASH_MAX) {
+        printk(KERN_ERR "xt_NAT: users_hash_size must be between %d and %d\n",
+               NAT_HASH_MIN, NAT_HASH_MAX);
+        return -EINVAL;
+    }
+    if (user_max_sessions < 1 || user_max_sessions > USHRT_MAX) {
+        printk(KERN_ERR "xt_NAT: user_max_sessions must be between 1 and %d\n", USHRT_MAX);
+        return -EINVAL;
+    }
+
     printk(KERN_INFO "xt_NAT DEBUG: NAT hash size: %d\n", nat_hash_size);
     printk(KERN_INFO "xt_NAT DEBUG: Users hash size: %d\n", users_hash_size);
 
