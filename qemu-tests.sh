@@ -569,15 +569,29 @@ t_aging() {
     local n="sessions age out and the tables drain"
     dmesg_mark
     # .3 is unused, so nothing ever replies and the sessions keep the 30s
-    # unreplied timeout: ~5 sweeps, so under a minute to disappear
-    ip netns exec $NS_SUB python3 "$TMPD/churn.py" $INET_NET.3 300 >/dev/null 2>&1
+    # unreplied timeout: ~5 sweeps, so under a minute to disappear.
+    #
+    # Prefer the benchmark generator: it makes tens of thousands of sessions in
+    # a few seconds from four sockets, where churn.py needs one socket each and
+    # manages a few hundred. This is the only test that drives the GC expiry
+    # path - decrement, NetFlow close record reading u.dst, then unlink from
+    # both tables and call_rcu over those same bytes - so sample size matters.
+    local gen="$TMPD/cps-gen" dmac
+    if [ -f "$SRCDIR/cps-gen.c" ] && gcc -O2 -o "$gen" "$SRCDIR/cps-gen.c" 2>/dev/null; then
+        dmac=$(ip link show xn-s0 | awk '/link\/ether/{print $2}')
+        info "filling with cps-gen for 3s"
+        ip netns exec $NS_SUB "$gen" xn-s1 "$dmac" "$SUB_NET.10" 500 "$INET_NET.3" 3 >/dev/null 2>&1
+    else
+        info "cps-gen unavailable, falling back to 300 sockets"
+        ip netns exec $NS_SUB python3 "$TMPD/churn.py" $INET_NET.3 300 >/dev/null 2>&1
+    fi
     sleep 2
     local peak; peak=$(nat_stat "Active NAT sessions")
     info "peak active sessions: ${peak:-?}"
     [ "${peak:-0}" -gt 0 ] || { fail "$n" "no sessions were created"; return; }
 
     local i act
-    for i in $(seq 1 24); do          # up to 120s
+    for i in $(seq 1 48); do          # up to 240s: a big table drains slowly under KASAN
         sleep 5
         act=$(nat_stat "Active NAT sessions")
         [ "${act:-1}" = 0 ] && break
@@ -586,7 +600,7 @@ t_aging() {
     if [ "${act:-1}" = 0 ]; then
         pass "$n"
     else
-        fail "$n" "$act sessions still active after 120s (was $peak)"
+        fail "$n" "$act sessions still active after 240s (was $peak)"
     fi
 }
 
