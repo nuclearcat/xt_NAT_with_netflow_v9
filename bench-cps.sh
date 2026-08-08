@@ -17,6 +17,7 @@
 #   ./bench-cps.sh --pool-sweep        1, 2, 4, 8, 16 NAT addresses
 #   ./bench-cps.sh --gc-cost           what the GC costs at rest, vs table size
 #   ./bench-cps.sh --netflow           with a collector attached, as deployed
+#   ./bench-cps.sh --det 1008          deterministic RFC 7422 port blocks
 #   ./bench-cps.sh --pool 1 --duration 40
 #                                      one NAT address, long enough to exhaust
 #                                      its 64512 ports and show what happens
@@ -47,6 +48,7 @@ SWEEP=0
 GCCOST=0
 NETFLOW=0
 QUARANTINE=0
+DET_PORTS=0
 KEEP=0
 
 if [ -t 1 ]; then
@@ -71,6 +73,7 @@ while [ $# -gt 0 ]; do
         --netflow)    NETFLOW=1 ;;
         --pool)       shift; POOL_END=203.0.113.${1:-4} ;;
         --quarantine) QUARANTINE=1 ;;
+        --det)        shift; DET_PORTS=${1:-1008} ;;
         --keep)     KEEP=1 ;;
         -h|--help)  usage ;;
         *) die "unknown option: $1" ;;
@@ -161,7 +164,13 @@ run_once() {
     local extra="user_max_sessions=65535"
     [ $NETFLOW    = 1 ] && extra="$extra nf_dest=$NF_DEST"
     [ $QUARANTINE = 1 ] && extra="$extra port_quarantine=1"
-    mod_up $extra || { say "${C_R}insmod failed${C_0}"; return 1; }
+        if [ "$DET_PORTS" != 0 ]; then
+        # subscriber range must fit: pool addresses x (64512/ports) subscribers
+        insmod "$MODULE" nat_pool=$POOL_START-$POOL_END:$SUB_CIDR:$DET_PORTS $extra \
+            || { say "${C_R}insmod failed (deterministic)${C_0}"; return 1; }
+    else
+        mod_up $extra || { say "${C_R}insmod failed${C_0}"; return 1; }
+    fi
     rules_up
 
     dmac=$(ip link show xn-s0 | awk '/link\/ether/{print $2}')
@@ -309,6 +318,26 @@ else
                 say "       proto $p $np used by:"
                 awk -v p="$p" -v np="$np" '$1==p && $4==np {print "         " $0}' /proc/net/NAT/sessions | head -3
               done
+    fi
+
+    # Deterministic mode makes a promise: every session's NAT address and port
+    # are computable from the subscriber address alone. Verify it against the
+    # kernel's own session list rather than trusting the arithmetic.
+    if [ "$DET_PORTS" != 0 ]; then
+        head_ "deterministic mapping"
+        awk -v base="$(int_from_ip "$SUB_NET.0")" -v ports="$DET_PORTS" \
+            -v pool="$(int_from_ip "$POOL_START")" '
+            function ip2i(s,  o) { split(s, o, "."); return o[1]*16777216 + o[2]*65536 + o[3]*256 + o[4] }
+            $1 ~ /^[0-9]+$/ && /->/ {
+                split($2, a, ":"); split($4, b, ":")
+                idx = ip2i(a[1]) - base; per = int(64512 / ports)
+                want_addr = pool + int(idx / per)
+                lo = 1024 + (idx % per) * ports
+                if (ip2i(b[1]) != want_addr || b[2] < lo || b[2] >= lo + ports) bad++
+                n++
+            }
+            END { printf "     %d sessions checked, %d outside their computed block\n", n, bad+0 }
+        ' /proc/net/NAT/sessions 2>/dev/null
     fi
 
     head_ "counters after the run"

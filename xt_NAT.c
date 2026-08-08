@@ -95,11 +95,15 @@ static atomic64_t pkt_drop_nosession = ATOMIC_INIT(0);
 static atomic64_t ses_fail_ulimit = ATOMIC_INIT(0);
 static atomic64_t ses_fail_noport = ATOMIC_INIT(0);
 static atomic64_t ses_fail_nomem = ATOMIC_INIT(0);
+static atomic64_t ses_fail_nomap = ATOMIC_INIT(0);   /* deterministic mode only */
 
 static char nat_pool_buf[128] = "127.0.0.1-127.0.0.1";
 static char *nat_pool = nat_pool_buf;
 module_param(nat_pool, charp, 0444);
-MODULE_PARM_DESC(nat_pool, "NAT pool range (addr_start-addr_end), default = 127.0.0.1-127.0.0.1");
+MODULE_PARM_DESC(nat_pool,
+    "NAT pool: <start>-<end> for shared ports (default), or "
+    "<start>-<end>:<subscriber_cidr>:<ports_per_subscriber> for deterministic "
+    "RFC 7422 mapping, e.g. 203.0.113.1-203.0.113.4:10.0.0.0/20:1008");
 
 static int nat_hash_size = 256 * 1024;
 module_param(nat_hash_size, int, 0444);
@@ -154,6 +158,29 @@ u_int32_t users_htable_vector = 0;
 /* the pool bounds are needed by the port bitmap helpers below */
 static u_int32_t nat_pool_start;
 static u_int32_t nat_pool_end;
+
+/* Deterministic mapping, RFC 7422. Off unless nat_pool carries the extra
+ * fields, in which case the subscriber's public address and its port block are
+ * both computed from its private address, so (public ip, port, time) can be
+ * reversed to a subscriber without any per-session log.
+ *
+ * The cost is that every address in the subscriber range gets a block reserved
+ * whether or not it is in use - reversibility without logging means there is
+ * nowhere to record which slots are live. A half-empty /16 therefore needs the
+ * same pool as a full one. That is checked at load, not discovered in
+ * production.
+ *
+ * jhash cannot be used here: it spreads subscribers unevenly, so no fixed block
+ * index can be derived from it. Deterministic mode packs sequentially instead,
+ * which is why it is opt-in rather than a change to the existing mapping.
+ */
+static u_int32_t nat_det_base;          /* first subscriber address, host order */
+static u_int32_t nat_det_count;         /* addresses in the subscriber range */
+static unsigned int nat_det_ports;      /* ports per subscriber, 0 = disabled */
+static unsigned int nat_det_per_addr;   /* subscribers sharing one NAT address */
+
+static inline bool nat_det_enabled(void) { return nat_det_ports != 0; }
+
 
 static spinlock_t *create_session_lock;
 
@@ -326,9 +353,40 @@ get_pool_size(void)
     return ntohl(nat_pool_end)-ntohl(nat_pool_start)+1;
 }
 
+/* subscriber -> (public address, port block). false when the subscriber falls
+ * outside the configured range, which the caller must treat as a drop. */
+static bool nat_det_map(const u_int32_t saddr, u_int32_t *nat_addr,
+                        unsigned int *lo, unsigned int *hi)
+{
+    u_int32_t host = ntohl(saddr);
+    u_int32_t idx, addr_idx, block;
+
+    if (host < nat_det_base)
+        return false;
+    idx = host - nat_det_base;
+    if (idx >= nat_det_count)
+        return false;
+
+    addr_idx = idx / nat_det_per_addr;
+    if (addr_idx >= get_pool_size())        /* refused at load, so cannot happen */
+        return false;
+    block = idx % nat_det_per_addr;
+
+    *nat_addr = htonl(ntohl(nat_pool_start) + addr_idx);
+    *lo = NAT_PORT_LO + block * nat_det_ports;
+    *hi = *lo + nat_det_ports;
+    return true;
+}
+
 static inline u_int32_t
 get_nat_addr(const u_int32_t addr)
 {
+    u_int32_t na;
+    unsigned int lo, hi;
+
+    if (nat_det_enabled())
+        return nat_det_map(addr, &na, &lo, &hi) ? na : 0;
+
     return htonl(ntohl(nat_pool_start)+reciprocal_scale(jhash_1word(addr, 0), get_pool_size()));
 }
 
@@ -571,7 +629,9 @@ static inline void nat_release_port(struct nat_session *sess)
         clear_bit(ntohs(sess->out_port), map);
 }
 
-static uint16_t search_free_l4_port(const uint8_t proto, const u_int32_t nataddr, const uint16_t userport)
+static uint16_t search_free_l4_port(const uint8_t proto, const u_int32_t nataddr,
+                                    const uint16_t userport,
+                                    unsigned int lo, unsigned int hi)
 {
     unsigned long *map;
     unsigned int start, port;
@@ -580,19 +640,21 @@ static uint16_t search_free_l4_port(const uint8_t proto, const u_int32_t nataddr
     if (unlikely(map == NULL))
         return userport;
 
+    /* deterministic mode narrows [lo,hi) to this subscriber's block, so a
+     * subscriber can only ever consume its own ports */
     start = ntohs(userport);
-    if (start < NAT_PORT_LO)
-        start += NAT_PORT_LO;
+    if (start < lo || start >= hi)
+        start = lo + (start % (hi - lo));
 
     /* port preservation: the subscriber's own source port when it is free,
      * which is what the linear scan produced in the common case */
     if (!test_and_set_bit(start, map))
         return htons(start);
 
-    port = find_next_zero_bit(map, NAT_PORT_BITS, start);
-    if (port >= NAT_PORT_BITS)                  /* wrap to [1024, start) */
-        port = find_next_zero_bit(map, start, NAT_PORT_LO);
-    if (port >= NAT_PORT_BITS || port < NAT_PORT_LO)
+    port = find_next_zero_bit(map, hi, start);
+    if (port >= hi)                             /* wrap to [lo, start) */
+        port = find_next_zero_bit(map, start, lo);
+    if (port >= hi || port < lo)
         return 0;
     if (unlikely(test_and_set_bit(port, map)))
         return 0;
@@ -832,13 +894,28 @@ static void netflow_export_flow_v9(const uint8_t proto, const u_int32_t srcaddr,
     spin_unlock_bh(&nfsend_lock);
 }
 
-static struct nat_session *create_nat_session(const uint8_t proto, const u_int32_t useraddr, const uint16_t userport, const u_int32_t dstaddr, const uint16_t dstport, const u_int32_t nataddr)
+static struct nat_session *create_nat_session(const uint8_t proto, const u_int32_t useraddr, const uint16_t userport, const u_int32_t dstaddr, const uint16_t dstport)
 {
     struct nat_session *sess, *existing;
+    unsigned int lo = NAT_PORT_LO, hi = NAT_PORT_BITS;
+    u_int32_t nataddr;
     uint16_t natport;
     unsigned int nataddr_id, hash;
 
     NAT_STAT_INC(tried);
+
+    /* Computed here rather than per packet: an established session carries its
+     * own nat_addr, so the datapath never needs this. */
+    if (nat_det_enabled()) {
+        if (unlikely(!nat_det_map(useraddr, &nataddr, &lo, &hi))) {
+            atomic64_inc(&ses_fail_nomap);
+            printk_ratelimited(KERN_NOTICE "xt_NAT: %pI4 is outside the deterministic subscriber range\n",
+                               &useraddr);
+            return NULL;
+        }
+    } else {
+        nataddr = get_nat_addr(useraddr);
+    }
 
     if (unlikely(check_user_limits(proto, useraddr) == 0)) {
         atomic64_inc(&ses_fail_ulimit);
@@ -873,7 +950,7 @@ static struct nat_session *create_nat_session(const uint8_t proto, const u_int32
 
     if (likely(proto == IPPROTO_TCP || proto == IPPROTO_UDP || proto == IPPROTO_ICMP)) {
         rcu_read_lock_bh();
-        natport = search_free_l4_port(proto, nataddr, userport);
+        natport = search_free_l4_port(proto, nataddr, userport, lo, hi);
         rcu_read_unlock_bh();
         if (natport == 0) {
             atomic64_inc(&ses_fail_noport);
@@ -929,7 +1006,6 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
     struct udphdr *udp;
     struct icmphdr *icmp;
     struct nat_session *session;
-    uint32_t nat_addr;
     uint16_t nat_port;
     unsigned int inner_hlen;
     unsigned int icmp_off;
@@ -956,8 +1032,6 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
     }
 
     if (info->variant == XTNAT_SNAT) {
-        nat_addr = get_nat_addr(ip->saddr);
-
         if (ip->protocol == IPPROTO_TCP) {
             if (unlikely(skb->len < ip_hdrlen(skb) + sizeof(struct tcphdr))) {
                 atomic64_inc(&pkt_drop_trunc);
@@ -975,11 +1049,11 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             rcu_read_lock_bh();
             session = lookup_session_in(ip->protocol, ip->saddr, tcp->source);
             if (session) {
-                csum_replace4(&ip->check, ip->saddr, nat_addr);
-                inet_proto_csum_replace4(&tcp->check, skb, ip->saddr, nat_addr, true);
+                csum_replace4(&ip->check, ip->saddr, session->nat_addr);
+                inet_proto_csum_replace4(&tcp->check, skb, ip->saddr, session->nat_addr, true);
                 inet_proto_csum_replace2(&tcp->check, skb, tcp->source, session->out_port, true);
 
-                ip->saddr = nat_addr;
+                ip->saddr = session->nat_addr;
                 tcp->source = session->out_port;
 
                 if (tcp->fin || tcp->rst) {
@@ -997,7 +1071,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 rcu_read_unlock_bh();
             } else {
                 rcu_read_unlock_bh();
-                session = create_nat_session(ip->protocol, ip->saddr, tcp->source, ip->daddr, tcp->dest, nat_addr);
+                session = create_nat_session(ip->protocol, ip->saddr, tcp->source, ip->daddr, tcp->dest);
                 if (session == NULL) {
                     atomic64_inc(&pkt_drop_nosession);
                     return NF_DROP;
@@ -1029,12 +1103,12 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             rcu_read_lock_bh();
             session = lookup_session_in(ip->protocol, ip->saddr, udp->source);
             if (session) {
-                csum_replace4(&ip->check, ip->saddr, nat_addr);
+                csum_replace4(&ip->check, ip->saddr, session->nat_addr);
                 if (udp->check) {
-                    inet_proto_csum_replace4(&udp->check, skb, ip->saddr, nat_addr, true);
+                    inet_proto_csum_replace4(&udp->check, skb, ip->saddr, session->nat_addr, true);
                     inet_proto_csum_replace2(&udp->check, skb, udp->source, session->out_port, true);
                 }
-                ip->saddr = nat_addr;
+                ip->saddr = session->nat_addr;
                 udp->source = session->out_port;
                 if ((session->flags & FLAG_REPLIED) == 0) {
                     session->timeout=30;
@@ -1044,7 +1118,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 rcu_read_unlock_bh();
             } else {
                 rcu_read_unlock_bh();
-                session = create_nat_session(ip->protocol, ip->saddr, udp->source, ip->daddr, udp->dest, nat_addr);
+                session = create_nat_session(ip->protocol, ip->saddr, udp->source, ip->daddr, udp->dest);
                 if (session == NULL) {
                     atomic64_inc(&pkt_drop_nosession);
                     return NF_DROP;
@@ -1081,8 +1155,8 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             rcu_read_lock_bh();
             session = lookup_session_in(ip->protocol, ip->saddr, nat_port);
             if (session) {
-                csum_replace4(&ip->check, ip->saddr, nat_addr);
-                ip->saddr = nat_addr;
+                csum_replace4(&ip->check, ip->saddr, session->nat_addr);
+                ip->saddr = session->nat_addr;
 
                 if (icmp->type == 0 || icmp->type == 8) {
                     inet_proto_csum_replace2(&icmp->checksum, skb, nat_port, session->out_port, true);
@@ -1092,7 +1166,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 rcu_read_unlock_bh();
             } else {
                 rcu_read_unlock_bh();
-                session = create_nat_session(ip->protocol, ip->saddr, nat_port, ip->daddr, nat_port, nat_addr);
+                session = create_nat_session(ip->protocol, ip->saddr, nat_port, ip->daddr, nat_port);
                 if (session == NULL) {
                     atomic64_inc(&pkt_drop_nosession);
                     return NF_DROP;
@@ -1115,8 +1189,8 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             rcu_read_lock_bh();
             session = lookup_session_in(ip->protocol, ip->saddr, 0);
             if (session) {
-                csum_replace4(&ip->check, ip->saddr, nat_addr);
-                ip->saddr = nat_addr;
+                csum_replace4(&ip->check, ip->saddr, session->nat_addr);
+                ip->saddr = session->nat_addr;
                 if ((session->flags & FLAG_REPLIED) == 0) {
                     session->timeout=30;
                 } else {
@@ -1125,7 +1199,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 rcu_read_unlock_bh();
             } else {
                 rcu_read_unlock_bh();
-                session = create_nat_session(ip->protocol, ip->saddr, 0, ip->daddr, 0, nat_addr);
+                session = create_nat_session(ip->protocol, ip->saddr, 0, ip->daddr, 0);
                 if (session == NULL) {
                     atomic64_inc(&pkt_drop_nosession);
                     return NF_DROP;
@@ -1678,11 +1752,15 @@ static int stat_seq_show(struct seq_file *m, void *v)
     seq_printf(m, "Active Users: %lld\n", atomic64_read(&users_active));
     seq_printf(m, "Max sessions per user: %d\n", READ_ONCE(user_max_sessions));
     seq_printf(m, "Port quarantine: %d\n", READ_ONCE(port_quarantine));
+    if (nat_det_enabled())
+        seq_printf(m, "Deterministic ports per subscriber: %u (%u per address)\n",
+                   nat_det_ports, nat_det_per_addr);
 
     /* why session creation refused - the first two are the capacity limits */
     seq_printf(m, "Failed sessions user limit: %lld\n", atomic64_read(&ses_fail_ulimit));
     seq_printf(m, "Failed sessions no free port: %lld\n", atomic64_read(&ses_fail_noport));
     seq_printf(m, "Failed sessions no memory: %lld\n", atomic64_read(&ses_fail_nomem));
+    seq_printf(m, "Failed sessions unmapped subscriber: %lld\n", atomic64_read(&ses_fail_nomap));
 
     /* why packets were dropped */
     seq_printf(m, "Dropped no session: %lld\n", atomic64_read(&pkt_drop_nosession));
@@ -1800,10 +1878,100 @@ static struct xt_target nat_tg_reg __read_mostly = {
     .me       = THIS_MODULE,
 };
 
+/* nat_pool=<start>-<end>[:<subscriber_cidr>:<ports_per_subscriber>]
+ *
+ * Without the optional fields the pool behaves exactly as before: address by
+ * jhash, ports shared across every subscriber on that address. With them,
+ * both the address and the port block are computed from the subscriber
+ * address, and no per-session log is needed to reverse the mapping.
+ */
+static int __init nat_pool_parse(void)
+{
+    char buf[128], *p, *range, *sub, *portstr, *sep;
+    unsigned int ports, need, per_addr, prefix;
+    u_int32_t subnet;
+
+    if (strscpy(buf, nat_pool, sizeof(buf)) < 0) {
+        printk(KERN_ERR "xt_NAT: nat_pool string too long\n");
+        return -EINVAL;
+    }
+
+    p = buf;
+    range   = strsep(&p, ":");
+    sub     = strsep(&p, ":");
+    portstr = strsep(&p, ":");
+
+    sep = range ? strchr(range, '-') : NULL;
+    if (!sep) {
+        printk(KERN_ERR "xt_NAT: nat_pool needs <start>-<end>\n");
+        return -EINVAL;
+    }
+    *sep = '\0';
+    nat_pool_start = in_aton(range);
+    nat_pool_end   = in_aton(sep + 1);
+
+    if (!nat_pool_start || !nat_pool_end || ntohl(nat_pool_start) > ntohl(nat_pool_end)) {
+        printk(KERN_ERR "xt_NAT: bad IP pool %pI4 to %pI4\n", &nat_pool_start, &nat_pool_end);
+        return -EINVAL;
+    }
+    printk(KERN_INFO "xt_NAT DEBUG: IP Pool from %pI4 to %pI4\n", &nat_pool_start, &nat_pool_end);
+
+    if (!sub && !portstr)                       /* shared-port mode, as before */
+        return 0;
+    if (!sub || !portstr) {
+        printk(KERN_ERR "xt_NAT: deterministic mode needs both <subscriber_cidr> and <ports_per_subscriber>\n");
+        return -EINVAL;
+    }
+
+    sep = strchr(sub, '/');
+    if (!sep) {
+        printk(KERN_ERR "xt_NAT: subscriber range must be a CIDR, e.g. 10.0.0.0/20\n");
+        return -EINVAL;
+    }
+    *sep = '\0';
+    subnet = in_aton(sub);
+    if (kstrtouint(sep + 1, 10, &prefix) || prefix > 32) {
+        printk(KERN_ERR "xt_NAT: bad subscriber prefix length\n");
+        return -EINVAL;
+    }
+    if (kstrtouint(portstr, 10, &ports) || ports < 1 || ports > (NAT_PORT_BITS - NAT_PORT_LO)) {
+        printk(KERN_ERR "xt_NAT: ports_per_subscriber must be 1..%u\n", NAT_PORT_BITS - NAT_PORT_LO);
+        return -EINVAL;
+    }
+
+    nat_det_count = (prefix == 0) ? 0xffffffffu : (1u << (32 - prefix));
+    nat_det_base  = ntohl(subnet) & ~(nat_det_count - 1);
+    nat_det_ports = ports;
+    per_addr      = (NAT_PORT_BITS - NAT_PORT_LO) / ports;
+    if (per_addr == 0) {
+        printk(KERN_ERR "xt_NAT: ports_per_subscriber larger than the port space\n");
+        return -EINVAL;
+    }
+    nat_det_per_addr = per_addr;
+
+    /* Every address in the range needs a reserved block whether or not it is
+     * in use - that is what makes the mapping reversible without logs, and it
+     * is why an idle subscriber still costs ports. Say so now rather than
+     * blackholing whoever falls off the end.
+     */
+    need = DIV_ROUND_UP(nat_det_count, per_addr);
+    if (need > get_pool_size()) {
+        printk(KERN_ERR "xt_NAT: deterministic mapping needs %u NAT addresses for %u subscribers "
+                        "at %u ports each (%u per address); the pool has %u\n",
+               need, nat_det_count, ports, per_addr, get_pool_size());
+        nat_det_ports = 0;
+        return -EINVAL;
+    }
+
+    printk(KERN_INFO "xt_NAT: deterministic mapping: %u subscribers from %pI4/%u, "
+                     "%u ports each, %u per address, %u of %u pool addresses used\n",
+           nat_det_count, &subnet, prefix, ports, per_addr, need, get_pool_size());
+    return 0;
+}
+
 static int __init nat_tg_init(void)
 {
-    char buff[128] = { 0 };
-    int i, j, ret;
+    int ret;
 
     printk(KERN_INFO "Module xt_NAT loaded\n");
 
@@ -1828,43 +1996,8 @@ static int __init nat_tg_init(void)
     templateV9.s_type_id	= htons(230);
     templateV9.s_type_len	= htons(1);
 
-    for(i=0, j=0; i<128 && nat_pool[i] != '-' && nat_pool[i] != '\0'; i++, j++) {
-        buff[j] = nat_pool[i];
-    }
-    nat_pool_start = in_aton(buff);
-
-    for(i++, j=0; i<128 && nat_pool[i] != '-' && nat_pool[i] != '\0'; i++, j++) {
-        buff[j] = nat_pool[i];
-    }
-    nat_pool_end = in_aton(buff);
-
-    if (nat_pool_start && nat_pool_end && nat_pool_start <= nat_pool_end ) {
-        printk(KERN_INFO "xt_NAT DEBUG: IP Pool from %pI4 to %pI4\n", &nat_pool_start, &nat_pool_end);
-    } else {
-        printk(KERN_INFO "xt_NAT DEBUG: BAD IP Pool from %pI4 to %pI4\n", &nat_pool_start, &nat_pool_end);
+    if (nat_pool_parse() < 0)
         return -EINVAL;
-    }
-
-    /* Both are used as the divisor in reciprocal_scale() and are sliced by
-     * the GC timers (/100 and /60), so zero or negative is not merely odd -
-     * kzalloc(0) hands back ZERO_SIZE_PTR, which is not NULL, so the
-     * allocation check passes and the first packet dereferences it.
-     */
-    if (nat_hash_size < NAT_HASH_MIN || nat_hash_size > NAT_HASH_MAX) {
-        printk(KERN_ERR "xt_NAT: nat_hash_size must be between %d and %d\n",
-               NAT_HASH_MIN, NAT_HASH_MAX);
-        return -EINVAL;
-    }
-    if (users_hash_size < NAT_HASH_MIN || users_hash_size > NAT_HASH_MAX) {
-        printk(KERN_ERR "xt_NAT: users_hash_size must be between %d and %d\n",
-               NAT_HASH_MIN, NAT_HASH_MAX);
-        return -EINVAL;
-    }
-
-    if (user_max_sessions < 1 || user_max_sessions > USHRT_MAX) {
-        printk(KERN_ERR "xt_NAT: user_max_sessions must be between 1 and %d\n", USHRT_MAX);
-        return -EINVAL;
-    }
 
     printk(KERN_INFO "xt_NAT DEBUG: NAT hash size: %d\n", nat_hash_size);
     printk(KERN_INFO "xt_NAT DEBUG: Users hash size: %d\n", users_hash_size);
