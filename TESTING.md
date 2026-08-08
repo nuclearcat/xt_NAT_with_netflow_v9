@@ -122,6 +122,13 @@ falsified: hoisting allocations out of the session lock (0%), per-CPU counters
 mattered was data layout. A cheap experiment cancelled a planned per-CPU NetFlow
 rewrite before any of it was written.
 
+**A config knob that is a no-op still looks enabled.** The CI workflow set
+`CONFIG_X86_64` after `make tinyconfig` and had been building 32-bit kernels for
+its whole existence: `tinyconfig` starts from i386, and `X86_64` is *selected by*
+`64BIT`, so enabling it directly does nothing and `olddefconfig` drops it without
+a word. Grep the resulting `.config` for what you asked for, not the script that
+asked.
+
 **Absolute numbers from this rig are worthless; comparisons are not.** veth on
 4 vCPUs in a VM is not a NIC. Use it to compare commits, pool sizes, session
 counts and configurations.
@@ -163,9 +170,10 @@ sustains 1.9x the rate by recycling ports immediately.
   source port after a fill phase.
 - 4 vCPUs cannot show contention that only appears at 32.
 - `--kdir` has been exercised on 7.0 only.
-- The CI workflow (`testing-kernels.yaml`) now covers 7.0 and 6.19 either side
-  of the `sockaddr_unsized` boundary, but it is `workflow_dispatch` only and has
-  never been run against any of this work.
+- The CI workflow (`testing-kernels.yaml`) covers 7.0 and 6.19 either side of
+  the `sockaddr_unsized` boundary. Its 6.19 leg has been reproduced locally and
+  passes; the other seven legs have not been run, and it is still
+  `workflow_dispatch` only.
 - **The benchmark has outgrown its own resolution.** At ~750k cps it is
   generator-bound and allocates several million sessions a run, and two runs of
   the same build differ by about 9% - against 1.9% at one NAT address earlier.

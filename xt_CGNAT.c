@@ -2348,7 +2348,10 @@ static int __init nat_tg_init(void)
      * cacheline and SLAB_HWCACHE_ALIGN adds no padding. Adding a field would
      * silently double the cost of every lookup, so say so at build time.
      */
-    BUILD_BUG_ON(sizeof(struct nat_session) != 64);
+    /* 64 bytes is a 64-bit property: rcu_head and hlist_node halve on 32-bit,
+     * where the struct is 40 and the cacheline argument does not apply. Assert
+     * where it means something rather than refusing to build elsewhere. */
+    BUILD_BUG_ON(sizeof(void *) == 8 && sizeof(struct nat_session) != 64);
 
     nat_session_cache = kmem_cache_create("xt_CGNAT_session",
                                           sizeof(struct nat_session), 0,

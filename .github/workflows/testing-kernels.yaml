@@ -39,6 +39,10 @@ jobs:
           run: |
             cd linux-${{ matrix.kernel-version }}
             make tinyconfig
+            # tinyconfig starts from i386 and allnoconfig clears CONFIG_64BIT,
+            # so the build was 32-bit: CONFIG_X86_64 is *selected by* 64BIT and
+            # enabling it directly does nothing. This module targets x86-64.
+            ./scripts/config --enable CONFIG_64BIT
             ./scripts/config --enable CONFIG_X86_64
             ./scripts/config --enable CONFIG_NET
             ./scripts/config --enable CONFIG_INET
