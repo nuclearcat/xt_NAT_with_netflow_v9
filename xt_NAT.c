@@ -46,6 +46,22 @@ static atomic64_t dnat_dropped = ATOMIC_INIT(0);
 static atomic64_t frags = ATOMIC_INIT(0);
 static atomic64_t related_icmp = ATOMIC_INIT(0);
 
+/* Drop accounting. Every one of these used to be a printk on the packet path,
+ * which meant a flood of malformed packets - or simply a NAT address running
+ * out of ports - turned into a log storm that cost far more than the drop.
+ * Counters instead: they are on the error paths only, so a shared atomic is
+ * cheap enough, and they are what you actually want when the box hits a limit.
+ */
+static atomic64_t pkt_drop_proto = ATOMIC_INIT(0);
+static atomic64_t pkt_drop_hdrlen = ATOMIC_INIT(0);
+static atomic64_t pkt_drop_frag = ATOMIC_INIT(0);
+static atomic64_t pkt_drop_trunc = ATOMIC_INIT(0);
+static atomic64_t pkt_drop_unwritable = ATOMIC_INIT(0);
+static atomic64_t pkt_drop_nosession = ATOMIC_INIT(0);
+static atomic64_t ses_fail_ulimit = ATOMIC_INIT(0);
+static atomic64_t ses_fail_noport = ATOMIC_INIT(0);
+static atomic64_t ses_fail_nomem = ATOMIC_INIT(0);
+
 static char nat_pool_buf[128] = "127.0.0.1-127.0.0.1";
 static char *nat_pool = nat_pool_buf;
 module_param(nat_pool, charp, 0444);
@@ -485,7 +501,8 @@ static void update_user_limits(const u_int8_t proto, const u_int32_t addr, const
         user = kzalloc(sz, GFP_ATOMIC);
 
         if (user == NULL) {
-            printk(KERN_WARNING "xt_NAT update_user_limits ERROR: Cannot allocate memory for user_session\n");
+            atomic64_inc(&ses_fail_nomem);
+            printk_ratelimited(KERN_WARNING "xt_NAT update_user_limits ERROR: Cannot allocate memory for user_session\n");
             spin_unlock_bh(&ht_users[hash].lock);
             return;
         }
@@ -646,7 +663,8 @@ static struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_in
     atomic64_inc(&sessions_tried);
 
     if (unlikely(check_user_limits(proto, useraddr) == 0)) {
-        printk(KERN_NOTICE "xt_NAT: %pI4 exceed max allowed sessions\n", &useraddr);
+        atomic64_inc(&ses_fail_ulimit);
+        printk_ratelimited(KERN_NOTICE "xt_NAT: %pI4 exceed max allowed sessions\n", &useraddr);
         return NULL;
     }
 
@@ -672,7 +690,8 @@ static struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_in
         natport = search_free_l4_port(proto, nataddr, userport);
         rcu_read_unlock_bh();
         if (natport == 0) {
-            printk(KERN_WARNING "xt_NAT create_nat_session ERROR: Not found free nat port for %d %pI4:%u -> %pI4:XXXX\n", proto, &useraddr, userport, &nataddr);
+            atomic64_inc(&ses_fail_noport);
+            printk_ratelimited(KERN_WARNING "xt_NAT create_nat_session ERROR: Not found free nat port for %d %pI4:%u -> %pI4:XXXX\n", proto, &useraddr, userport, &nataddr);
             spin_unlock_bh(&create_session_lock[nataddr_id]);
             return NULL;
         }
@@ -684,7 +703,8 @@ static struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_in
     data_session = kzalloc(sz, GFP_ATOMIC);
 
     if (unlikely(data_session == NULL)) {
-        printk(KERN_WARNING "xt_NAT create_nat_session ERROR: Cannot allocate memory for data_session\n");
+        atomic64_inc(&ses_fail_nomem);
+        printk_ratelimited(KERN_WARNING "xt_NAT create_nat_session ERROR: Cannot allocate memory for data_session\n");
         spin_unlock_bh(&create_session_lock[nataddr_id]);
         return NULL;
     }
@@ -693,7 +713,8 @@ static struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_in
     session = kzalloc(sz, GFP_ATOMIC);
 
     if (unlikely(session == NULL)) {
-        printk(KERN_WARNING "xt_NAT ERROR: Cannot allocate memory for ht_inner session\n");
+        atomic64_inc(&ses_fail_nomem);
+        printk_ratelimited(KERN_WARNING "xt_NAT ERROR: Cannot allocate memory for ht_inner session\n");
         kfree(data_session);
         spin_unlock_bh(&create_session_lock[nataddr_id]);
         return NULL;
@@ -703,7 +724,8 @@ static struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_in
     session2 = kzalloc(sz, GFP_ATOMIC);
 
     if (unlikely(session2 == NULL)) {
-        printk(KERN_WARNING "xt_NAT ERROR: Cannot allocate memory for ht_outer session\n");
+        atomic64_inc(&ses_fail_nomem);
+        printk_ratelimited(KERN_WARNING "xt_NAT ERROR: Cannot allocate memory for ht_outer session\n");
         kfree(data_session);
         kfree(session);
         spin_unlock_bh(&create_session_lock[nataddr_id]);
@@ -773,22 +795,22 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
     const struct xt_nat_tginfo *info = par->targinfo;
 
     if (unlikely(skb->protocol != htons(ETH_P_IP))) {
-        printk(KERN_DEBUG "xt_NAT DEBUG: Drop not IP packet\n");
+        atomic64_inc(&pkt_drop_proto);
         return NF_DROP;
     }
     if (unlikely(ip_hdrlen(skb) != sizeof(struct iphdr))) {
-        printk(KERN_DEBUG "xt_NAT DEBUG: Drop truncated IP packet\n");
+        atomic64_inc(&pkt_drop_hdrlen);
         return NF_DROP;
     }
 
     ip = (struct iphdr *)skb_network_header(skb);
 
     if (unlikely(ip->frag_off & htons(IP_OFFSET))) {
-        printk(KERN_DEBUG "xt_NAT DEBUG: Drop fragmented IP packet\n");
+        atomic64_inc(&pkt_drop_frag);
         return NF_DROP;
     }
     if (unlikely(ip->version != 4)) {
-        printk(KERN_DEBUG "xt_NAT DEBUG: Drop not IPv4 IP packet\n");
+        atomic64_inc(&pkt_drop_proto);
         return NF_DROP;
     }
 
@@ -797,11 +819,11 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 
         if (ip->protocol == IPPROTO_TCP) {
             if (unlikely(skb->len < ip_hdrlen(skb) + sizeof(struct tcphdr))) {
-                printk(KERN_DEBUG "xt_NAT SNAT: Drop truncated TCP packet\n");
+                atomic64_inc(&pkt_drop_trunc);
                 return NF_DROP;
             }
             if (unlikely(compat_skb_ensure_writable(skb, ip_hdrlen(skb) + sizeof(struct tcphdr)))) {
-                printk(KERN_DEBUG "xt_NAT SNAT: Drop unwritable TCP packet\n");
+                atomic64_inc(&pkt_drop_unwritable);
                 return NF_DROP;
             }
             ip = (struct iphdr *)skb_network_header(skb);
@@ -836,6 +858,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 rcu_read_unlock_bh();
                 session = create_nat_session(ip->protocol, ip->saddr, tcp->source, ip->daddr, tcp->dest, nat_addr);
                 if (session == NULL) {
+                    atomic64_inc(&pkt_drop_nosession);
                     return NF_DROP;
                 }
 
@@ -849,11 +872,11 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 
         } else if (ip->protocol == IPPROTO_UDP) {
             if (unlikely(skb->len < ip_hdrlen(skb) + sizeof(struct udphdr))) {
-                printk(KERN_DEBUG "xt_NAT SNAT: Drop truncated UDP packet\n");
+                atomic64_inc(&pkt_drop_trunc);
                 return NF_DROP;
             }
             if (unlikely(compat_skb_ensure_writable(skb, ip_hdrlen(skb) + sizeof(struct udphdr)))) {
-                printk(KERN_DEBUG "xt_NAT SNAT: Drop unwritable UDP packet\n");
+                atomic64_inc(&pkt_drop_unwritable);
                 return NF_DROP;
             }
             ip = (struct iphdr *)skb_network_header(skb);
@@ -882,6 +905,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 rcu_read_unlock_bh();
                 session = create_nat_session(ip->protocol, ip->saddr, udp->source, ip->daddr, udp->dest, nat_addr);
                 if (session == NULL) {
+                    atomic64_inc(&pkt_drop_nosession);
                     return NF_DROP;
                 }
                 csum_replace4(&ip->check, ip->saddr, session->addr);
@@ -895,11 +919,11 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             }
         } else if (ip->protocol == IPPROTO_ICMP) {
             if (unlikely(skb->len < ip_hdrlen(skb) + sizeof(struct icmphdr))) {
-                printk(KERN_DEBUG "xt_NAT SNAT: Drop truncated ICMP packet\n");
+                atomic64_inc(&pkt_drop_trunc);
                 return NF_DROP;
             }
             if (unlikely(compat_skb_ensure_writable(skb, ip_hdrlen(skb) + sizeof(struct icmphdr)))) {
-                printk(KERN_DEBUG "xt_NAT SNAT: Drop unwritable ICMP packet\n");
+                atomic64_inc(&pkt_drop_unwritable);
                 return NF_DROP;
             }
             ip = (struct iphdr *)skb_network_header(skb);
@@ -929,6 +953,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 rcu_read_unlock_bh();
                 session = create_nat_session(ip->protocol, ip->saddr, nat_port, ip->daddr, nat_port, nat_addr);
                 if (session == NULL) {
+                    atomic64_inc(&pkt_drop_nosession);
                     return NF_DROP;
                 }
                 csum_replace4(&ip->check, ip->saddr, session->addr);
@@ -941,7 +966,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             }
         } else {
             if (unlikely(compat_skb_ensure_writable(skb, ip_hdrlen(skb)))) {
-                printk(KERN_DEBUG "xt_NAT SNAT: Drop unwritable packet\n");
+                atomic64_inc(&pkt_drop_unwritable);
                 return NF_DROP;
             }
             ip = (struct iphdr *)skb_network_header(skb);
@@ -961,6 +986,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 rcu_read_unlock_bh();
                 session = create_nat_session(ip->protocol, ip->saddr, 0, ip->daddr, 0, nat_addr);
                 if (session == NULL) {
+                    atomic64_inc(&pkt_drop_nosession);
                     return NF_DROP;
                 }
                 csum_replace4(&ip->check, ip->saddr, session->addr);
@@ -971,13 +997,13 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
     } else if (info->variant == XTNAT_DNAT) {
         if (ip->protocol == IPPROTO_TCP) {
             if (unlikely(skb->len < ip_hdrlen(skb) + sizeof(struct tcphdr))) {
-                printk(KERN_DEBUG "xt_NAT DNAT: Drop truncated TCP packet\n");
+                atomic64_inc(&pkt_drop_trunc);
                 return NF_DROP;
             }
             if (unlikely(skb_headlen(skb) < ip_hdrlen(skb) + sizeof(struct tcphdr)))
                 atomic64_inc(&frags);
             if (unlikely(compat_skb_ensure_writable(skb, ip_hdrlen(skb) + sizeof(struct tcphdr)))) {
-                printk(KERN_DEBUG "xt_NAT DNAT: Drop unwritable TCP packet\n");
+                atomic64_inc(&pkt_drop_unwritable);
                 return NF_DROP;
             }
             ip = (struct iphdr *)skb_network_header(skb);
@@ -1011,13 +1037,13 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             }
         } else if (ip->protocol == IPPROTO_UDP) {
             if (unlikely(skb->len < ip_hdrlen(skb) + sizeof(struct udphdr))) {
-                printk(KERN_DEBUG "xt_NAT DNAT: Drop truncated UDP packet\n");
+                atomic64_inc(&pkt_drop_trunc);
                 return NF_DROP;
             }
             if (unlikely(skb_headlen(skb) < ip_hdrlen(skb) + sizeof(struct udphdr)))
                 atomic64_inc(&frags);
             if (unlikely(compat_skb_ensure_writable(skb, ip_hdrlen(skb) + sizeof(struct udphdr)))) {
-                printk(KERN_DEBUG "xt_NAT DNAT: Drop unwritable UDP packet\n");
+                atomic64_inc(&pkt_drop_unwritable);
                 return NF_DROP;
             }
             ip = (struct iphdr *)skb_network_header(skb);
@@ -1048,11 +1074,11 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             }
         } else if (ip->protocol == IPPROTO_ICMP) {
             if (unlikely(skb->len < ip_hdrlen(skb) + sizeof(struct icmphdr))) {
-                printk(KERN_DEBUG "xt_NAT DNAT: Drop truncated ICMP packet\n");
+                atomic64_inc(&pkt_drop_trunc);
                 return NF_DROP;
             }
             if (unlikely(compat_skb_ensure_writable(skb, ip_hdrlen(skb) + sizeof(struct icmphdr)))) {
-                printk(KERN_DEBUG "xt_NAT DNAT: Drop unwritable ICMP packet\n");
+                atomic64_inc(&pkt_drop_unwritable);
                 return NF_DROP;
             }
             ip = (struct iphdr *)skb_network_header(skb);
@@ -1066,12 +1092,12 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             } else if (icmp->type == 3 || icmp->type == 4 || icmp->type == 5 || icmp->type == 11 || icmp->type == 12 || icmp->type == 31) {
                 atomic64_inc(&related_icmp);
                 if (skb->len < ip_hdrlen(skb) + sizeof(struct icmphdr) + sizeof(struct iphdr)) {
-                    printk(KERN_DEBUG "xt_NAT DNAT: Drop related ICMP packet witch truncated IP header\n");
+                    atomic64_inc(&pkt_drop_trunc);
                     return NF_DROP;
                 }
 
                 if (unlikely(compat_skb_ensure_writable(skb, sizeof(struct iphdr) + sizeof(struct icmphdr) + sizeof(struct iphdr)))) {
-                    printk(KERN_DEBUG "xt_NAT DNAT: Drop unwritable related ICMP packet\n");
+                    atomic64_inc(&pkt_drop_unwritable);
                     return NF_DROP;
                 }
 
@@ -1087,7 +1113,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                  */
                 inner_hlen = ip->ihl * 4;
                 if (ip->ihl < 5) {
-                    printk(KERN_DEBUG "xt_NAT DNAT: Drop related ICMP packet witch bad IP header\n");
+                    atomic64_inc(&pkt_drop_hdrlen);
                     return NF_DROP;
                 }
 
@@ -1096,11 +1122,11 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                  * them.
                  */
                 if (skb->len < sizeof(struct iphdr) + sizeof(struct icmphdr) + inner_hlen + 8) {
-                    printk(KERN_DEBUG "xt_NAT DNAT: Drop related ICMP packet witch truncated header\n");
+                    atomic64_inc(&pkt_drop_trunc);
                     return NF_DROP;
                 }
                 if (unlikely(compat_skb_ensure_writable(skb, sizeof(struct iphdr) + sizeof(struct icmphdr) + inner_hlen + 8))) {
-                    printk(KERN_DEBUG "xt_NAT DNAT: Drop unwritable related ICMP packet\n");
+                    atomic64_inc(&pkt_drop_unwritable);
                     return NF_DROP;
                 }
                 /* the pull above may have moved the data */
@@ -1213,7 +1239,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             }
         } else {
             if (unlikely(compat_skb_ensure_writable(skb, ip_hdrlen(skb)))) {
-                printk(KERN_DEBUG "xt_NAT DNAT: Drop unwritable packet\n");
+                atomic64_inc(&pkt_drop_unwritable);
                 return NF_DROP;
             }
             ip = (struct iphdr *)skb_network_header(skb);
@@ -1503,6 +1529,19 @@ static int stat_seq_show(struct seq_file *m, void *v)
     seq_printf(m, "Fragmented pkts: %lld\n", atomic64_read(&frags));
     seq_printf(m, "Related ICMP pkts: %lld\n", atomic64_read(&related_icmp));
     seq_printf(m, "Active Users: %lld\n", atomic64_read(&users_active));
+
+    /* why session creation refused - the first two are the capacity limits */
+    seq_printf(m, "Failed sessions user limit: %lld\n", atomic64_read(&ses_fail_ulimit));
+    seq_printf(m, "Failed sessions no free port: %lld\n", atomic64_read(&ses_fail_noport));
+    seq_printf(m, "Failed sessions no memory: %lld\n", atomic64_read(&ses_fail_nomem));
+
+    /* why packets were dropped */
+    seq_printf(m, "Dropped no session: %lld\n", atomic64_read(&pkt_drop_nosession));
+    seq_printf(m, "Dropped bad proto: %lld\n", atomic64_read(&pkt_drop_proto));
+    seq_printf(m, "Dropped ip options: %lld\n", atomic64_read(&pkt_drop_hdrlen));
+    seq_printf(m, "Dropped ip fragment: %lld\n", atomic64_read(&pkt_drop_frag));
+    seq_printf(m, "Dropped truncated: %lld\n", atomic64_read(&pkt_drop_trunc));
+    seq_printf(m, "Dropped unwritable: %lld\n", atomic64_read(&pkt_drop_unwritable));
 
     return 0;
 }
