@@ -31,6 +31,11 @@ address and port to any external IP address and port
 per user per protocol (default 4096, max 65535). It is writable at runtime via
 `/sys/module/xt_CGNAT/parameters/user_max_sessions`
 * No ALGs for FTP/SIP/PPTP are implemented
+* Multiple named pools, selected per rule with `--pool`, addable and removable
+  at runtime
+* Optional **deterministic** port mapping (RFC 7422): the public address and
+  port block are computed from the subscriber address, so no per-session log is
+  needed to attribute a connection
 * NAT events export using **Netflow v9**
 * NAT statistics via /proc interface
 
@@ -83,6 +88,25 @@ and counters are in `/proc/net/CGNAT/pools`; `statistics` shows the totals.
 Note `/proc/net/CGNAT/users` no longer prints a NAT address: with several pools
 a subscriber's public address depends on which rule matched, and that table is
 keyed only on the private address. `sessions` has the real mapping.
+
+## Module parameters
+
+All are load-time only unless noted.
+
+| parameter | default | meaning |
+|---|---|---|
+| `nat_pool` | `127.0.0.1-127.0.0.1` | pool definitions, see [Pools](#pools) |
+| `nat_hash_size` | 262144 | session hash buckets, 1024..16777216. Two tables of this size. At more sessions than buckets, chains lengthen and every packet walks further - size it to your expected session count |
+| `users_hash_size` | 65536 | subscriber hash buckets, same range |
+| `user_max_sessions` | 4096 | concurrent sessions per subscriber **per protocol**, 1..65535. Writable at runtime via `/sys/module/xt_CGNAT/parameters/user_max_sessions` |
+| `port_quarantine` | 0 | when a NAT port becomes reusable. 0 releases it as soon as the session stops being findable, which maximises capacity but lets a port be reissued while the old session is still in the table. 1 holds it until the session is unlinked, about one GC sweep later - no port is ever mapped to two sessions, at the cost of holding roughly ten seconds of expiring sessions' ports out of service. Writable at runtime; the choice is fixed per session at creation, so changing it affects only new sessions |
+| `nf_dest` | none | NetFlow v9 collectors, `addr:port[,addr:port]` |
+
+Note `user_max_sessions` is a cap on top of whatever ports are available. Under
+deterministic mapping the port block is usually the tighter limit: with
+endpoint-independent mapping a subscriber consumes one port per distinct source
+port, regardless of how many different destinations it talks to, so a 1008-port
+block is 1008 concurrent connections in total.
 
 ## Migrating from xt_NAT
 

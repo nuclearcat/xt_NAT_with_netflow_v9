@@ -69,11 +69,22 @@ things without which the rig cannot run at all:
 ./run-vm.sh --bench-only --bench-args "--gc-cost"
 ./run-vm.sh --bench-only --bench-args "--netflow"
 ./run-vm.sh --bench-only --bench-args "--pool 1 --duration 40 --quarantine"
+./run-vm.sh --bench-only --bench-args "--pool 254 --det 200 --duration 8"
 ```
+
+Other `bench-cps.sh` flags: `--senders N` (default one per core, capped at 4),
+`--src-ips N` (distinct subscribers, default 2000), `--keep` (leave the topology
+up). `--det <ports>` loads the pool with deterministic RFC 7422 blocks and
+verifies, against the kernel's own session list, that every session landed in
+the block computed from its subscriber address.
 
 `cps-gen.c` drives unique (source address, source port) pairs with AF_PACKET and
 `sendmmsg()`, so it hands complete frames to the device and skips the local
 routing and socket paths — what is measured is the NAT, not the generator.
+
+The suite also covers named pools and runtime pool management - adding a pool
+through `/proc/net/CGNAT/pools`, refusing an overlapping range, a duplicate
+name, and a delete while a rule or a session still references it.
 
 `--pool-sweep` runs 1, 2, 4, 8, 16 NAT addresses. It was written when
 `create_session_lock[]` — one spinlock per NAT address — was the constraint. It
@@ -122,13 +133,13 @@ stated. Two-run means. Reproduce with the commands above.
 
 | measurement | value | how |
 |---|---|---|
-| session setup, unsaturated | **702,558 cps** | `--pool 254 --duration 8`, generator-bound, so a floor |
+| session setup, unsaturated | **~750,000 cps** | `--pool 254 --duration 8`, generator-bound, so a floor; ±9% run to run |
 | session setup, saturated address | 2,995 cps | `--pool 1 --duration 40` |
 | tx pps while exhausted | 1,296,840 | same; the module rejects in O(1) |
 | memory per session | **64 bytes** | one cacheline, one allocation |
 | GC cost at rest | 0.2–0.3% of one core | `--gc-cost`, flat to 347k sessions |
 | NetFlow export cost | −0.2% (free) | `--netflow`, 18,848 packets delivered |
-| functional suite | **14/14** | `--kdir --soak`, KASAN + lockdep, dmesg and kmemleak clean |
+| functional suite | **16/16** | `--kdir --soak`, KASAN + lockdep, dmesg and kmemleak clean |
 
 With `port_quarantine=1` on a saturated address: 1,612 cps, zero duplicate
 `(proto, nat ip, port)`, linked sessions exactly 64512. Off is the default and
@@ -152,5 +163,12 @@ sustains 1.9x the rate by recycling ports immediately.
   source port after a fill phase.
 - 4 vCPUs cannot show contention that only appears at 32.
 - `--kdir` has been exercised on 7.0 only.
-- The CI workflow (`testing-kernels.yaml`) stops at 6.18 and is manually
-  triggered, so it cannot see the ≥6.19 build break that `compat.h` now handles.
+- The CI workflow (`testing-kernels.yaml`) now covers 7.0 and 6.19 either side
+  of the `sockaddr_unsized` boundary, but it is `workflow_dispatch` only and has
+  never been run against any of this work.
+- **The benchmark has outgrown its own resolution.** At ~750k cps it is
+  generator-bound and allocates several million sessions a run, and two runs of
+  the same build differ by about 9% - against 1.9% at one NAT address earlier.
+  Anything smaller than that now hides. For validating a per-session change,
+  use a pool large enough not to saturate but a run short enough to keep
+  allocator variance down, e.g. `--pool 64 --duration 2`.
