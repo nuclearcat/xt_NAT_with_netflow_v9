@@ -11,9 +11,17 @@
  * inside a VM - veth and a virtual CPU are not a NIC.
  *
  *   cps-gen <ifname> <dst-mac> <src-ip-base> <n-src-ips> <dst-ip> <seconds>
+ *           [ports-per-ip]
  *
  * Source addresses run from src-ip-base for n-src-ips consecutive addresses,
  * source ports cycle 1024..65535. Prints "sent <packets> in <sec>".
+ *
+ * ports-per-ip bounds the port range, and with it the whole tuple space, to
+ * n-src-ips * ports-per-ip. Once that many sessions exist the generator is
+ * replaying traffic over established ones instead of creating new ones, which
+ * is the only way to measure forwarding rather than session setup - and
+ * forwarding is what a NAT spends nearly all of its time doing. 0 means the
+ * full range, i.e. keep creating.
  */
 
 #define _GNU_SOURCE
@@ -89,13 +97,14 @@ int main(int argc, char **argv)
 	struct iovec iov[BATCH];
 	struct sockaddr_ll sll;
 	unsigned int base_ip, dst_ip, n_ips, port = PORT_LO, ip_off = 0;
+	unsigned int port_hi = PORT_HI, per_ip = 0;
 	unsigned long long sent = 0;
 	double deadline, start;
 	int fd, ifindex, i, seconds;
 
-	if (argc != 7) {
+	if (argc != 7 && argc != 8) {
 		fprintf(stderr,
-			"usage: %s <ifname> <dst-mac> <src-ip-base> <n-src-ips> <dst-ip> <seconds>\n",
+			"usage: %s <ifname> <dst-mac> <src-ip-base> <n-src-ips> <dst-ip> <seconds> [ports-per-ip]\n",
 			argv[0]);
 		return 2;
 	}
@@ -109,6 +118,13 @@ int main(int argc, char **argv)
 	dst_ip  = inet_addr(argv[5]);
 	seconds = atoi(argv[6]);
 	if (!n_ips) n_ips = 1;
+	if (argc == 8) {
+		per_ip = (unsigned int)strtoul(argv[7], NULL, 10);
+		if (per_ip) {
+			port_hi = PORT_LO + per_ip - 1;
+			if (port_hi > PORT_HI) port_hi = PORT_HI;
+		}
+	}
 
 	fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
 	if (fd < 0) { perror("socket(AF_PACKET)"); return 1; }
@@ -176,7 +192,7 @@ int main(int argc, char **argv)
 			 */
 			if (++ip_off >= n_ips) {
 				ip_off = 0;
-				if (++port > PORT_HI)
+				if (++port > port_hi)
 					port = PORT_LO;
 			}
 		}
@@ -192,6 +208,8 @@ int main(int argc, char **argv)
 	}
 
 	printf("sent %llu in %.2f\n", sent, now_sec() - start);
+	if (per_ip)
+		printf("tuples %llu\n", (unsigned long long)n_ips * per_ip);
 	close(fd);
 	return 0;
 }

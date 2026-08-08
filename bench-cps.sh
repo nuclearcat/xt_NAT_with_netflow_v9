@@ -18,6 +18,9 @@
 #   ./bench-cps.sh --gc-cost           what the GC costs at rest, vs table size
 #   ./bench-cps.sh --netflow           with a collector attached, as deployed
 #   ./bench-cps.sh --det 1008          deterministic RFC 7422 port blocks
+#   ./bench-cps.sh --established 50    forwarding rate over established sessions,
+#                                      not session setup - the metric a NAT
+#                                      actually lives on
 #   ./bench-cps.sh --pool 1 --duration 40
 #                                      one NAT address, long enough to exhaust
 #                                      its 64512 ports and show what happens
@@ -48,6 +51,7 @@ SWEEP=0
 GCCOST=0
 NETFLOW=0
 QUARANTINE=0
+PER_IP=0
 DET_PORTS=0
 KEEP=0
 
@@ -73,6 +77,7 @@ while [ $# -gt 0 ]; do
         --netflow)    NETFLOW=1 ;;
         --pool)       shift; POOL_END=203.0.113.${1:-4} ;;
         --quarantine) QUARANTINE=1 ;;
+        --established) shift; PER_IP=${1:-50} ;;
         --det)        shift; DET_PORTS=${1:-1008} ;;
         --keep)     KEEP=1 ;;
         -h|--help)  usage ;;
@@ -184,7 +189,7 @@ run_once() {
     for i in $(seq 0 $((SENDERS - 1))); do
         ip netns exec $NS_SUB "$GEN" xn-s1 "$dmac" \
             "$(ip_from_int $(( SRC_BASE + i * slice )))" "$slice" \
-            "$INET_NET.2" "$DURATION" \
+            "$INET_NET.2" "$DURATION" $PER_IP \
             > "$TMPD/gen.$i" 2>&1 &
         pids+=($!)
     done
@@ -214,6 +219,15 @@ run_once() {
 
     printf '%-12s %10s %10s %10s %10s %10s %10s\n' \
         "$label" "$pps" "$cps" "$tried" "${d[3]}" "${d[4]}" "${d[6]}"
+
+    # In established mode the tuple space is bounded, so after the first pass
+    # every packet hits a session that already exists: pps is forwarding rate,
+    # and packets-per-session says how much of the run was actually forwarding.
+    if [ "$PER_IP" != 0 ]; then
+        awk -v p="$total_sent" -v c="${d[1]}" -v t="$elapsed" 'BEGIN{
+            if (c > 0) printf "     forwarding: %d pps over %d established sessions (%.0f packets each)\n", p/t, c, p/c
+        }'
+    fi
 
     LAST_D=("${d[@]}")
     LAST_CPS=$cps

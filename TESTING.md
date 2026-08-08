@@ -70,11 +70,15 @@ things without which the rig cannot run at all:
 ./run-vm.sh --bench-only --bench-args "--netflow"
 ./run-vm.sh --bench-only --bench-args "--pool 1 --duration 40 --quarantine"
 ./run-vm.sh --bench-only --bench-args "--pool 254 --det 200 --duration 8"
+./run-vm.sh --bench-only --bench-args "--pool 254 --duration 10 --established 50"
 ```
 
 Other `bench-cps.sh` flags: `--senders N` (default one per core, capped at 4),
 `--src-ips N` (distinct subscribers, default 2000), `--keep` (leave the topology
-up). `--det <ports>` loads the pool with deterministic RFC 7422 blocks and
+up). `--established <ports-per-ip>` bounds the generator's tuple space to
+`src-ips x ports-per-ip`, so after a short fill phase every packet matches a
+session that already exists and what is measured is forwarding, not setup.
+`--det <ports>` loads the pool with deterministic RFC 7422 blocks and
 verifies, against the kernel's own session list, that every session landed in
 the block computed from its subscriber address.
 
@@ -140,6 +144,7 @@ stated. Two-run means. Reproduce with the commands above.
 
 | measurement | value | how |
 |---|---|---|
+| forwarding, established sessions | **~1,780,000 pps** | `--pool 254 --duration 10 --established 50`, 99,900 sessions; 1.84M / 1.73M |
 | session setup, unsaturated | **~750,000 cps** | `--pool 254 --duration 8`, generator-bound, so a floor; ±9% run to run |
 | session setup, saturated address | 2,995 cps | `--pool 1 --duration 40` |
 | tx pps while exhausted | 1,296,840 | same; the module rejects in O(1) |
@@ -164,10 +169,9 @@ sustains 1.9x the rate by recycling ports immediately.
 
 ## Known limits
 
-- pps on **established** sessions has never been measured. Every number here is
-  session creation. A CGNAT forwards far more packets than it creates sessions,
-  so this is the gap that matters most; it needs `cps-gen` to stop advancing the
-  source port after a fill phase.
+- Forwarding is measured in the SNAT direction only, and both directions of a
+  session share one hash lookup path, so the DNAT reply path is inferred rather
+  than measured.
 - 4 vCPUs cannot show contention that only appears at 32.
 - `--kdir` has been exercised on 7.0 only.
 - The CI workflow (`testing-kernels.yaml`) covers 7.0 and 6.19 either side of
