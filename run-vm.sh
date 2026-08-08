@@ -54,6 +54,11 @@ KERNEL=""
 SOAK=0
 KEEP=0
 SHELL_MODE=0
+REFRESH=0
+ACCEL="unknown"
+BENCH=0
+BENCH_ARGS=
+RUN_TESTS=1
 
 if [ -t 1 ]; then
     C_G=$'\033[32m'; C_R=$'\033[31m'; C_Y=$'\033[33m'; C_B=$'\033[1m'; C_0=$'\033[0m'
@@ -128,8 +133,12 @@ while [ $# -gt 0 ]; do
         --memory)  shift; MEMORY=${1:-4096} ;;
         --timeout) shift; TIMEOUT=${1:-1800} ;;
         --soak)    SOAK=1 ;;
+        --bench)   BENCH=1 ;;
+        --bench-only) BENCH=1; RUN_TESTS=0 ;;
+        --bench-args) shift; BENCH_ARGS=${1:-} ;;
         --keep)    KEEP=1 ;;
         --shell)   SHELL_MODE=1 ;;
+        --refresh-image) REFRESH=1 ;;
         --print-kconfig) print_kconfig; exit 0 ;;
         -h|--help) usage ;;
         *) die "unknown option: $1 (try --help)" ;;
@@ -172,6 +181,11 @@ fi
 
 mkdir -p "$CACHE"
 IMAGE=$CACHE/$(basename "$IMAGE_URL")
+# base image + the toolchain apt installed on the first run. Saved after a run
+# that got far enough to build, and used as the backing file from then on, so
+# later runs neither install nor download anything.
+PREPARED=$CACHE/prepared-$UBUNTU_RELEASE.qcow2
+[ $REFRESH = 1 ] && rm -f "$PREPARED"
 
 fetch_image() {
     if [ -f "$IMAGE" ]; then
@@ -228,9 +242,24 @@ export DEBIAN_FRONTEND=noninteractive
 PKGS="build-essential pkg-config libxtables-dev iptables tcpdump ethtool python3 kmod"
 [ "${BUILD_MODULE_IN_GUEST:-0}" = 1 ] && PKGS="$PKGS linux-headers-$(uname -r)"
 
-echo "### installing: $PKGS"
-apt-get update -qq          || echo "### apt update failed, continuing"
-apt-get install -y -qq $PKGS || fatal "could not install build dependencies"
+# A prepared image already has all of this, and re-running apt is the single
+# largest cost of a run - and the only step that needs the network at all.
+deps_present() {
+    command -v gcc      >/dev/null 2>&1 || return 1
+    command -v python3  >/dev/null 2>&1 || return 1
+    command -v iptables >/dev/null 2>&1 || return 1
+    pkg-config --exists xtables 2>/dev/null || return 1
+    [ "${BUILD_MODULE_IN_GUEST:-0}" != 1 ] || [ -d "/lib/modules/$(uname -r)/build" ] || return 1
+    return 0
+}
+
+if deps_present; then
+    echo "### toolchain already present, skipping apt"
+else
+    echo "### installing: $PKGS"
+    apt-get update -qq          || echo "### apt update failed, continuing"
+    apt-get install -y -qq $PKGS || fatal "could not install build dependencies"
+fi
 
 # 9p is fine for reading, but build somewhere native
 rm -rf /root/src && mkdir -p /root/src
@@ -251,12 +280,40 @@ make libxt_NAT.so || fatal "userspace extension build failed"
 
 modinfo /root/src/xt_NAT.ko | sed -n '1,6p'
 
-echo "### running qemu-tests.sh ${TEST_ARGS:-}"
-chmod +x /root/src/qemu-tests.sh
-MODULE=/root/src/xt_NAT.ko /root/src/qemu-tests.sh ${TEST_ARGS:-}
-rc=$?
+{
+    echo "kernel=$(uname -r)"
+    echo "distro=$(sed -n 's/^PRETTY_NAME="\(.*\)"/\1/p' /etc/os-release)"
+    echo "vcpus=$(nproc)"
+    echo "memory_mb=$(( $(awk '/MemTotal/{print $2}' /proc/meminfo) / 1024 ))"
+    echo "gcc=$(gcc --version 2>/dev/null | head -1)"
+    echo "vermagic=$(modinfo -F vermagic /root/src/xt_NAT.ko 2>/dev/null)"
+    dbg=""
+    for o in KASAN PROVE_LOCKING PROVE_RCU DEBUG_ATOMIC_SLEEP DEBUG_OBJECTS_TIMERS \
+             DEBUG_KMEMLEAK SLUB_DEBUG DEBUG_LIST LOCK_STAT; do
+        grep -q "^CONFIG_$o=y" "/boot/config-$(uname -r)" 2>/dev/null && dbg="$dbg $o"
+    done
+    echo "kernel_debug=${dbg:-none}"
+} > "$ART/env.txt"
+
+chmod +x /root/src/qemu-tests.sh /root/src/bench-cps.sh
+rc=0
+
+if [ "${RUN_TESTS:-1}" = 1 ]; then
+    echo "### running qemu-tests.sh ${TEST_ARGS:-}"
+    MODULE=/root/src/xt_NAT.ko /root/src/qemu-tests.sh ${TEST_ARGS:-} 2>&1 | tee "$ART/tests.txt"
+    rc=${PIPESTATUS[0]}
+    echo "### qemu-tests.sh exited $rc"
+fi
+
+if [ "${RUN_BENCH:-0}" = 1 ]; then
+    echo "### running bench-cps.sh ${BENCH_ARGS:-}"
+    MODULE=/root/src/xt_NAT.ko /root/src/bench-cps.sh ${BENCH_ARGS:-} 2>&1 | tee "$ART/bench.txt"
+    brc=${PIPESTATUS[0]}
+    echo "### bench-cps.sh exited $brc"
+    [ "$rc" = 0 ] && rc=$brc
+fi
+
 echo $rc > "$ART/exit-code"
-echo "### qemu-tests.sh exited $rc"
 
 cp /root/src/xt_NAT.ko "$ART/" 2>/dev/null
 finish
@@ -288,7 +345,7 @@ EOF
 #cloud-config
 runcmd:
   - [ sh, -c, "mkdir -p /mnt/xtnat && mount -t 9p -o trans=virtio,version=9p2000.L,msize=262144 xtnat /mnt/xtnat || echo '### 9p mount FAILED' > /dev/console" ]
-  - [ sh, -c, "BUILD_MODULE_IN_GUEST=$BUILD_IN_GUEST TEST_ARGS='$testargs' bash /mnt/xtnat/guest-run.sh > /dev/console 2>&1" ]
+  - [ sh, -c, "BUILD_MODULE_IN_GUEST=$BUILD_IN_GUEST RUN_TESTS=$RUN_TESTS TEST_ARGS='$testargs' RUN_BENCH=$BENCH BENCH_ARGS='$BENCH_ARGS' bash /mnt/xtnat/guest-run.sh > /dev/console 2>&1" ]
 power_state:
   mode: poweroff
   timeout: 60
@@ -306,6 +363,120 @@ EOF
             xorriso -as mkisofs -quiet -output "$RUNDIR/seed.iso" -volid CIDATA -joliet -rock \
                     "$RUNDIR/user-data" "$RUNDIR/meta-data" ;;
     esac || die "could not build the cloud-init seed image"
+}
+
+
+# ------------------------------------------------------------------ report ---
+
+# Assemble everything the guest recorded into one document. Printed condensed
+# to the terminal, written in full to vm-results/report.md.
+write_report() {
+    local R=$RESULTS/report.md A=$RESULTS
+    local rc=${1:-?} splats=0
+
+    [ -f "$A/dmesg.txt" ] && splats=$(grep -cE '\bBUG:|KASAN|UBSAN|WARNING:|INFO: possible|suspicious RCU|refcount_t|use-after-free' "$A/dmesg.txt")
+
+    {
+        echo "# xt_NAT VM test report"
+        echo
+        echo "Result: **$([ "$rc" = 0 ] && echo PASS || echo "FAIL (exit $rc)")**"
+        echo
+
+        echo "## Environment"
+        echo
+        echo "| | |"
+        echo "|---|---|"
+        if [ -f "$A/env.txt" ]; then
+            sed -n 's/^\([a-z_]*\)=\(.*\)$/| \1 | \2 |/p' "$A/env.txt"
+        fi
+        echo "| image | $(basename "$IMAGE") |"
+        echo "| acceleration | $ACCEL |"
+        echo "| host | $(uname -sr) |"
+        echo
+
+        if [ -f "$A/tests.txt" ]; then
+            echo "## Functional tests"
+            echo
+            echo '```'
+            grep -E '^(PASS|FAIL|SKIP) ' "$A/tests.txt" 2>/dev/null
+            echo
+            grep -E 'passed [0-9]+' "$A/tests.txt" 2>/dev/null | tail -1
+            echo '```'
+            echo
+            if grep -qE '^FAIL ' "$A/tests.txt"; then
+                echo "Failure detail:"
+                echo
+                echo '```'
+                grep -A1 -E '^FAIL ' "$A/tests.txt" | head -40
+                echo '```'
+                echo
+            fi
+        fi
+
+        if [ -f "$A/bench.txt" ]; then
+            echo "## Session setup rate"
+            echo
+            echo '```'
+            sed -n '/^pool  *tx pps/,/^$/p' "$A/bench.txt" 2>/dev/null
+            echo '```'
+            echo
+            echo "Ballpark only - veth inside a VM. Use for comparing runs, pool"
+            echo "sizes and commits, never as an absolute rate."
+            echo
+            if grep -q 'reading it' "$A/bench.txt"; then
+                sed -n '/== reading it ==/,$p' "$A/bench.txt" | sed '1d;/ballpark only/,$d'
+                echo
+            fi
+        fi
+
+        echo "## NAT counters"
+        echo
+        echo '```'
+        # whichever stage ran last printed the final statistics
+        if [ -f "$A/bench.txt" ] && grep -q 'counters after the run' "$A/bench.txt"; then
+            sed -n '/== counters after the run ==/,/^$/p' "$A/bench.txt" | sed '1d'
+        elif [ -f "$A/tests.txt" ]; then
+            sed -n '/== counters ==/,/^$/p' "$A/tests.txt" | sed '1d'
+        fi
+        echo '```'
+        echo
+
+        echo "## Kernel log"
+        echo
+        if [ "$splats" -gt 0 ]; then
+            echo "**$splats suspicious line(s)** in guest dmesg:"
+            echo
+            echo '```'
+            grep -E '\bBUG:|KASAN|UBSAN|WARNING:|INFO: possible|suspicious RCU|refcount_t|use-after-free' "$A/dmesg.txt" | head -20
+            echo '```'
+        else
+            echo "Clean - no BUG, KASAN, lockdep or RCU reports."
+        fi
+        echo
+        echo "Module load/unload cycles: $(grep -c 'Module xt_NAT loaded' "$A/dmesg.txt" 2>/dev/null || echo 0)"
+        echo
+
+        echo "## Artifacts"
+        echo
+        for f in "$A"/*; do
+            [ -f "$f" ] && printf -- "- \`%s\` (%s)\n" "$(basename "$f")" "$(du -h "$f" | cut -f1)"
+        done
+    } > "$R"
+
+    # condensed to the terminal
+    say ""
+    [ -f "$A/tests.txt" ] && grep -E 'passed [0-9]+' "$A/tests.txt" | tail -1 | sed 's/^/     /'
+    if [ -f "$A/bench.txt" ]; then
+        say ""
+        sed -n '/^pool  *tx pps/,/^$/p' "$A/bench.txt" | sed 's/^/     /'
+    fi
+    say ""
+    if [ "$splats" -gt 0 ]; then
+        say "     ${C_Y}dmesg: $splats suspicious line(s)${C_0}"
+    else
+        say "     dmesg: clean"
+    fi
+    say "     report: $R"
 }
 
 # -------------------------------------------------------------------- main ---
@@ -329,7 +500,8 @@ trap cleanup EXIT INT TERM
 # ---- assemble the payload
 
 step "assembling the guest payload"
-cp "$SRCDIR"/*.c "$SRCDIR"/*.h "$SRCDIR/Makefile" "$SRCDIR/qemu-tests.sh" "$RUNDIR/share/src/" \
+cp "$SRCDIR"/*.c "$SRCDIR"/*.h "$SRCDIR/Makefile" \
+   "$SRCDIR/qemu-tests.sh" "$SRCDIR/testnet.sh" "$SRCDIR/bench-cps.sh" "$RUNDIR/share/src/" \
     || die "could not copy the source tree"
 
 BUILD_IN_GUEST=1
@@ -347,7 +519,14 @@ write_cloud_init
 # ---- overlay so the downloaded image is never written to
 
 step "creating overlay disk"
-qemu-img create -q -f qcow2 -F qcow2 -b "$IMAGE" "$RUNDIR/disk.qcow2" 20G \
+if [ -f "$PREPARED" ]; then
+    BACKING=$PREPARED
+    say "backing: prepared image (toolchain already installed)"
+else
+    BACKING=$IMAGE
+    say "backing: base image - this run will install the toolchain and cache it"
+fi
+qemu-img create -q -f qcow2 -F qcow2 -b "$BACKING" "$RUNDIR/disk.qcow2" 20G \
     || die "qemu-img create failed"
 
 # ---- boot
@@ -362,9 +541,11 @@ QEMU=(qemu-system-x86_64
 
 if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
     QEMU+=(-enable-kvm -cpu host)
+    ACCEL="KVM"
     say "KVM: enabled"
 else
     warn "no access to /dev/kvm - falling back to emulation, this will be slow"
+    ACCEL="TCG (emulated)"
     QEMU+=(-cpu max)
 fi
 
@@ -378,7 +559,7 @@ else
 fi
 
 mkdir -p "$RESULTS"
-rm -f "$RESULTS"/*.log "$RESULTS"/*.txt 2>/dev/null
+rm -f "$RESULTS"/*.log "$RESULTS"/*.txt "$RESULTS"/*.md "$RESULTS"/exit-code 2>/dev/null
 CONSOLE=$RESULTS/console.log
 
 if [ $SHELL_MODE = 1 ]; then
@@ -395,7 +576,7 @@ qemu_rc=${PIPESTATUS[0]}
 # ---- collect
 
 step "collecting results"
-for f in guest.log dmesg.txt lock_stat.txt exit-code; do
+for f in guest.log dmesg.txt lock_stat.txt exit-code env.txt tests.txt bench.txt; do
     [ -f "$RUNDIR/share/artifacts/$f" ] && cp "$RUNDIR/share/artifacts/$f" "$RESULTS/"
 done
 
@@ -414,19 +595,18 @@ if [ -z "$rc" ]; then
     exit 1
 fi
 
-# replay the suite's own summary rather than paraphrasing it
-if [ -f "$RESULTS/guest.log" ]; then
-    sed -n '/^== summary ==/,$p' "$RESULTS/guest.log" | sed 's/^/    /'
+# env.txt only exists if the guest installed its dependencies and built the
+# module, so it is the signal that this disk is worth keeping.
+if [ ! -f "$PREPARED" ] && [ -f "$RESULTS/env.txt" ] && [ "$BACKING" = "$IMAGE" ]; then
+    if cp "$RUNDIR/disk.qcow2" "$PREPARED.tmp" && mv "$PREPARED.tmp" "$PREPARED"; then
+        say "cached prepared image ($(du -h "$PREPARED" | cut -f1)) - later runs skip apt"
+    else
+        rm -f "$PREPARED.tmp"
+        warn "could not cache the prepared image"
+    fi
 fi
 
-say ""
-say "artifacts in $RESULTS/:"
-for f in "$RESULTS"/*; do [ -f "$f" ] && printf '    %s (%s)\n' "$(basename "$f")" "$(du -h "$f" | cut -f1)"; done
-
-if [ -f "$RESULTS/dmesg.txt" ]; then
-    n=$(grep -cE '\bBUG:|KASAN|UBSAN|WARNING:|INFO: possible|suspicious RCU' "$RESULTS/dmesg.txt")
-    [ "${n:-0}" -gt 0 ] && say "" && say "${C_Y}$n suspicious line(s) in guest dmesg - check $RESULTS/dmesg.txt${C_0}"
-fi
+write_report "$rc"
 
 say ""
 if [ "$rc" = 0 ]; then
