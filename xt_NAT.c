@@ -29,6 +29,8 @@
 #define NAT_HASH_MIN 1024
 #define NAT_HASH_MAX (1 << 24)
 
+#define USER_MAX_SESSIONS_DEF 4096
+
 static LIST_HEAD(usock_list);
 static int sndbuf = 1310720;
 static int flowsetID = 300;
@@ -74,6 +76,17 @@ MODULE_PARM_DESC(nat_hash_size, "nat hash size, default = 256k");
 static int users_hash_size = 64 * 1024;
 module_param(users_hash_size, int, 0444);
 MODULE_PARM_DESC(users_hash_size, "users hash size, default = 64k");
+
+/* Per-user session cap, per protocol. Was hardcoded at 4096 in three places
+ * while the README advertised 1000. Mode 0644, so it is writable at runtime
+ * through /sys/module/xt_NAT/parameters/user_max_sessions without needing a
+ * /proc write path. The per-user counters are uint16_t, so values above
+ * USHRT_MAX cannot be represented and are clamped where it is read.
+ */
+static int user_max_sessions = USER_MAX_SESSIONS_DEF;
+module_param(user_max_sessions, int, 0644);
+MODULE_PARM_DESC(user_max_sessions,
+                 "max sessions per user per protocol (1-65535), default = 4096");
 
 static char nf_dest_buf[128] = "";
 static char *nf_dest = nf_dest_buf;
@@ -434,18 +447,22 @@ static int check_user_limits(const u_int8_t proto, const u_int32_t addr)
     rcu_read_lock_bh();
     head = &ht_users[hash].user;
     is_found=0;
+    /* read the tunable once: it is writable at runtime via sysfs, and the
+     * counters it is compared against are uint16_t */
+    session_limit = READ_ONCE(user_max_sessions);
+    if (session_limit < 1)
+        session_limit = 1;
+    else if (session_limit > USHRT_MAX)
+        session_limit = USHRT_MAX;
+
     hlist_for_each_entry_rcu(user, head, list_node) {
         if (user->addr == addr && user->idle < 15) {
-            if (proto == IPPROTO_TCP) {
+            if (proto == IPPROTO_TCP)
                 sessions = user->tcp_count;
-                session_limit = 4096;
-            } else if (proto == IPPROTO_UDP) {
+            else if (proto == IPPROTO_UDP)
                 sessions = user->udp_count;
-                session_limit = 4096;
-            } else {
+            else
                 sessions = user->other_count;
-                session_limit = 4096;
-            }
             is_found=1;
             break;
         }
@@ -1529,6 +1546,7 @@ static int stat_seq_show(struct seq_file *m, void *v)
     seq_printf(m, "Fragmented pkts: %lld\n", atomic64_read(&frags));
     seq_printf(m, "Related ICMP pkts: %lld\n", atomic64_read(&related_icmp));
     seq_printf(m, "Active Users: %lld\n", atomic64_read(&users_active));
+    seq_printf(m, "Max sessions per user: %d\n", READ_ONCE(user_max_sessions));
 
     /* why session creation refused - the first two are the capacity limits */
     seq_printf(m, "Failed sessions user limit: %lld\n", atomic64_read(&ses_fail_ulimit));
@@ -1709,6 +1727,11 @@ static int __init nat_tg_init(void)
     if (users_hash_size < NAT_HASH_MIN || users_hash_size > NAT_HASH_MAX) {
         printk(KERN_ERR "xt_NAT: users_hash_size must be between %d and %d\n",
                NAT_HASH_MIN, NAT_HASH_MAX);
+        return -EINVAL;
+    }
+
+    if (user_max_sessions < 1 || user_max_sessions > USHRT_MAX) {
+        printk(KERN_ERR "xt_NAT: user_max_sessions must be between 1 and %d\n", USHRT_MAX);
         return -EINVAL;
     }
 

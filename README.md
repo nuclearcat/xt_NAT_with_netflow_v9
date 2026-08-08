@@ -13,7 +13,9 @@ Compatibility tested with Linux Kernel 3.18 and 4.1
 * Endpoint Independent Mapping - the same NAT_IP:NAT_Port mapping is used for traffic sent from same subscriber IP
 address and port to any external IP address and port
 * Hairpinning - allows communication between two internal subscribers or internal hosts using the NAT IP
-* User quotas support. Default value is 1000 max connections for each user (for each protocol independly)
+* User quotas support. `user_max_sessions` sets the maximum concurrent sessions
+per user per protocol (default 4096, max 65535). It is writable at runtime via
+`/sys/module/xt_NAT/parameters/user_max_sessions`
 * No ALGs for FTP/SIP/PPTP are implemented
 * NAT events export using **Netflow v9**
 * NAT statistics via /proc interface
