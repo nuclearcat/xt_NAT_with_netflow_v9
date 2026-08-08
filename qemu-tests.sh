@@ -43,14 +43,7 @@ set -u
 SRCDIR=$(cd "$(dirname "$0")" && pwd)
 MODULE=${MODULE:-$SRCDIR/xt_NAT.ko}
 
-NS_SUB=xtnat-sub
-NS_INET=xtnat-inet
-SUB_NET=10.0.0
-INET_NET=198.51.100
-POOL_NET=203.0.113.0/24
-POOL_START=203.0.113.1
-POOL_END=203.0.113.4
-POOL_PREFIX=203.0.113.
+. "$SRCDIR/testnet.sh"
 
 SOAK=0
 KEEP=0
@@ -119,8 +112,6 @@ dmesg_check() {
 
 # ------------------------------------------------------------ environment ---
 
-need() { command -v "$1" >/dev/null 2>&1; }
-
 check_env() {
     local missing=()
     for t in ip iptables insmod rmmod python3; do
@@ -151,15 +142,8 @@ check_env() {
         say "${C_Y}XT_NAT_TEST_FORCE is set - running against the live kernel.${C_0}"
     fi
 
-    # Where to find libxt_NAT.so. Prefer the build directory so the test does
-    # not depend on 'make linstall' having been run; xtables searches a
-    # colon-separated list, so keep the system directory too.
-    local sysdir
-    sysdir=$(pkg-config --variable xtlibdir xtables 2>/dev/null)
-    [ -n "$sysdir" ] || sysdir=/usr/lib/xtables
-    export XTABLES_LIBDIR="$SRCDIR:$sysdir"
-    if [ ! -f "$SRCDIR/libxt_NAT.so" ] && [ ! -f "$sysdir/libxt_NAT.so" ]; then
-        say "libxt_NAT.so not found in $SRCDIR or $sysdir - run 'make' first"
+    if ! xtables_libdir_setup; then
+        say "libxt_NAT.so not found in $SRCDIR or the system xtables dir - run 'make' first"
         exit 1
     fi
 }
@@ -184,96 +168,7 @@ report_kernel_config() {
     fi
 }
 
-# -------------------------------------------------------------- topology ---
-
-ipt() { iptables "$@"; }
-
-net_up() {
-    ip netns add $NS_SUB
-    ip netns add $NS_INET
-
-    ip link add xn-s0 type veth peer name xn-s1
-    ip link add xn-i0 type veth peer name xn-i1
-    ip link set xn-s1 netns $NS_SUB
-    ip link set xn-i1 netns $NS_INET
-
-    ip addr add $SUB_NET.1/24 dev xn-s0
-    ip addr add $INET_NET.1/24 dev xn-i0
-    ip link set xn-s0 up
-    ip link set xn-i0 up
-
-    ip -n $NS_SUB addr add $SUB_NET.2/24 dev xn-s1
-    ip -n $NS_SUB link set xn-s1 up
-    ip -n $NS_SUB link set lo up
-    ip -n $NS_SUB route add default via $SUB_NET.1
-
-    ip -n $NS_INET addr add $INET_NET.2/24 dev xn-i1
-    ip -n $NS_INET link set xn-i1 up
-    ip -n $NS_INET link set lo up
-    # the NAT pool is reached through the DUT
-    ip -n $NS_INET route add $POOL_NET via $INET_NET.1
-
-    # keep packets un-coalesced so what the module sees is what we sent
-    if need ethtool; then
-        ethtool -K xn-s0 gro off gso off tso off >/dev/null 2>&1
-        ethtool -K xn-i0 gro off gso off tso off >/dev/null 2>&1
-        ip netns exec $NS_SUB ethtool -K xn-s1 gro off gso off tso off >/dev/null 2>&1
-        ip netns exec $NS_INET ethtool -K xn-i1 gro off gso off tso off >/dev/null 2>&1
-    fi
-
-    sysctl -qw net.ipv4.ip_forward=1
-    sysctl -qw net.ipv4.conf.all.rp_filter=0
-    sysctl -qw net.ipv4.conf.default.rp_filter=0
-}
-
-net_down() {
-    ip netns del $NS_SUB 2>/dev/null
-    ip netns del $NS_INET 2>/dev/null
-    ip link del xn-s0 2>/dev/null
-    ip link del xn-i0 2>/dev/null
-}
-
-# Insert at the head of each chain rather than appending, so an existing DROP
-# further down cannot shadow us - and delete exactly what we inserted rather
-# than flushing. Never touch the chain policies. If this ever runs somewhere
-# it should not, it must not take the host's firewall with it.
-rules_up() {
-    ipt -t raw -I PREROUTING 1 -s $SUB_NET.0/24 -j CT --notrack
-    ipt -t raw -I PREROUTING 1 -d $POOL_NET -j CT --notrack
-    ipt -t raw -I PREROUTING 1 -d $POOL_NET -j NAT --dnat
-    # return direction is DNATed in raw, then traverses FORWARD normally
-    ipt -I FORWARD 1 -i xn-i0 -o xn-s0 -d $SUB_NET.0/24 -j ACCEPT
-    # the NAT target is terminating for what it accepts, so it goes first
-    ipt -I FORWARD 1 -s $SUB_NET.0/24 -o xn-i0 -j NAT --snat
-}
-
-rules_down() {
-    ipt -D FORWARD -s $SUB_NET.0/24 -o xn-i0 -j NAT --snat 2>/dev/null
-    ipt -D FORWARD -i xn-i0 -o xn-s0 -d $SUB_NET.0/24 -j ACCEPT 2>/dev/null
-    ipt -t raw -D PREROUTING -d $POOL_NET -j NAT --dnat 2>/dev/null
-    ipt -t raw -D PREROUTING -d $POOL_NET -j CT --notrack 2>/dev/null
-    ipt -t raw -D PREROUTING -s $SUB_NET.0/24 -j CT --notrack 2>/dev/null
-    return 0
-}
-
-# insmod loads exactly the file it is given and resolves nothing, so every
-# symbol xt_NAT imports has to already be in the kernel. xt_register_target()
-# lives in x_tables, which on a freshly booted machine nothing has loaded yet -
-# the first insmod then fails with "Unknown symbol in module". It works on a
-# desktop only because something else pulled x_tables in first. The test rules
-# need the rest. (modprobe xt_NAT after make install/depmod handles this by
-# itself; insmod of a build-directory .ko does not.)
-preload_deps() {
-    local m
-    for m in x_tables ip_tables iptable_raw iptable_filter nf_conntrack xt_CT; do
-        modprobe $m 2>/dev/null
-    done
-    return 0
-}
-
-mod_up()       { insmod "$MODULE" nat_pool=$POOL_START-$POOL_END "$@"; }
-mod_down()     { rmmod xt_NAT 2>/dev/null; return 0; }
-module_loaded() { [ -d /proc/net/NAT ]; }
+# ---------------------------------------------------------- teardown ---
 
 cleanup() {
     [ "$KEEP" = 1 ] && { say "--keep: leaving topology up"; return; }
@@ -283,10 +178,6 @@ cleanup() {
     rm -rf "$TMPD"
 }
 
-nat_stat() {
-    # nat_stat "Active NAT sessions" -> number
-    sed -n "s/^$1: *//p" /proc/net/NAT/statistics 2>/dev/null | head -1
-}
 
 # --------------------------------------------------------------- helpers ---
 
@@ -550,13 +441,13 @@ t_icmp_malformed() {
 t_target_validation() {
     local n="rule without --snat/--dnat is rejected"
     dmesg_mark
-    if ipt -A FORWARD -s $SUB_NET.0/24 -j NAT 2>/dev/null; then
-        ipt -D FORWARD -s $SUB_NET.0/24 -j NAT 2>/dev/null
+    if ipt -A FORWARD -s $SUB_CIDR -j NAT 2>/dev/null; then
+        ipt -D FORWARD -s $SUB_CIDR -j NAT 2>/dev/null
         fail "$n" "iptables accepted a NAT rule with no direction"
         return
     fi
-    if ipt -A FORWARD -s $SUB_NET.0/24 -j NAT --snat --dnat 2>/dev/null; then
-        ipt -D FORWARD -s $SUB_NET.0/24 -j NAT --snat --dnat 2>/dev/null
+    if ipt -A FORWARD -s $SUB_CIDR -j NAT --snat --dnat 2>/dev/null; then
+        ipt -D FORWARD -s $SUB_CIDR -j NAT --snat --dnat 2>/dev/null
         fail "$n" "iptables accepted --snat --dnat together"
         return
     fi
