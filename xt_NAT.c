@@ -21,6 +21,7 @@
 
 #define FLAG_REPLIED   (1 << 0) /* 000001 */
 #define FLAG_TCP_FIN   (1 << 1) /* 000010 */
+#define FLAG_QUARANTINE (1 << 2) /* 000100 - release this port at unlink, not at timeout 0 */
 
 #define TCP_SYN_ACK 0x12
 #define TCP_FIN_RST 0x05
@@ -114,6 +115,29 @@ MODULE_PARM_DESC(users_hash_size, "users hash size, default = 64k");
  * /proc write path. The per-user counters are uint16_t, so values above
  * USHRT_MAX cannot be represented and are clamped where it is read.
  */
+/* When a NAT port becomes reusable.
+ *
+ * 0 (default): at timeout 0, the instant the session stops being visible to
+ *   lookup_session_out(). Maximum capacity, and what the linear scan did, but
+ *   a port can be reissued while the old session is still linked, so late
+ *   inbound packets for the dead flow reach the new subscriber, and the pool
+ *   can be oversubscribed without noport ever firing.
+ *
+ * 1: at unlink, one GC sweep later (~10s). A real quarantine, and noport
+ *   becomes a truthful capacity signal - at the cost of holding roughly ten
+ *   seconds' worth of expiring sessions' ports out of service.
+ *
+ * The choice is latched into the session at creation, before it is published,
+ * so each session releases its port exactly once no matter how the parameter
+ * is toggled at runtime. Deciding it in the GC instead would double-release
+ * across a 0->1 change - freeing a port that had already been reissued - and
+ * leak ports across 1->0.
+ */
+static int port_quarantine;
+module_param(port_quarantine, int, 0644);
+MODULE_PARM_DESC(port_quarantine,
+                 "hold a NAT port for one GC sweep (~10s) after the session ends rather than reusing it immediately, default 0");
+
 static int user_max_sessions = USER_MAX_SESSIONS_DEF;
 module_param(user_max_sessions, int, 0644);
 MODULE_PARM_DESC(user_max_sessions,
@@ -539,6 +563,14 @@ static struct nat_session *lookup_session_out(const uint8_t proto, const u_int32
  * cost grew as 1/(1-occupancy) and the exhausted case was a soft-lockup
  * generator.
  */
+static inline void nat_release_port(struct nat_session *sess)
+{
+    unsigned long *map = nat_ports_for(sess->nat_addr, sess->proto);
+
+    if (map)
+        clear_bit(ntohs(sess->out_port), map);
+}
+
 static uint16_t search_free_l4_port(const uint8_t proto, const u_int32_t nataddr, const uint16_t userport)
 {
     unsigned long *map;
@@ -862,7 +894,7 @@ static struct nat_session *create_nat_session(const uint8_t proto, const u_int32
     sess->u.dst.port = dstport;
     sess->timeout    = 30;
     sess->proto      = proto;
-    sess->flags      = 0;
+    sess->flags      = READ_ONCE(port_quarantine) ? FLAG_QUARANTINE : 0;
 
     hash = get_hash_nat_ent(proto, useraddr, userport);
     spin_lock_bh(&ht_inner[hash].lock);
@@ -1425,7 +1457,6 @@ static void sessions_cleanup_timer_callback( struct timer_list *timer )
 {
     struct nat_session *sess;
     struct hlist_node *next;
-    unsigned long *map;
     unsigned int i, ohash;
     uint8_t proto;
     u_int32_t addr;
@@ -1472,10 +1503,11 @@ static void sessions_cleanup_timer_callback( struct timer_list *timer )
                      * quarantine, at the cost of that many ports per second of
                      * churn being unavailable.
                      */
-                    map = nat_ports_for(sess->nat_addr, sess->proto);
-                    if (map)
-                        clear_bit(ntohs(sess->out_port), map);
+                    if (!(sess->flags & FLAG_QUARANTINE))
+                        nat_release_port(sess);
                 } else if (sess->timeout <= -10) {
+                    if (sess->flags & FLAG_QUARANTINE)
+                        nat_release_port(sess);
                     proto = sess->proto;
                     addr  = sess->in_addr;
 
@@ -1645,6 +1677,7 @@ static int stat_seq_show(struct seq_file *m, void *v)
     seq_printf(m, "Related ICMP pkts: %lld\n", NAT_STAT_READ(related_icmp));
     seq_printf(m, "Active Users: %lld\n", atomic64_read(&users_active));
     seq_printf(m, "Max sessions per user: %d\n", READ_ONCE(user_max_sessions));
+    seq_printf(m, "Port quarantine: %d\n", READ_ONCE(port_quarantine));
 
     /* why session creation refused - the first two are the capacity limits */
     seq_printf(m, "Failed sessions user limit: %lld\n", atomic64_read(&ses_fail_ulimit));

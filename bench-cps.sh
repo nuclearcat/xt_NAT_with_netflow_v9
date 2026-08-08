@@ -46,6 +46,7 @@ N_SRC_IPS=2000
 SWEEP=0
 GCCOST=0
 NETFLOW=0
+QUARANTINE=0
 KEEP=0
 
 if [ -t 1 ]; then
@@ -69,6 +70,7 @@ while [ $# -gt 0 ]; do
         --gc-cost)    GCCOST=1 ;;
         --netflow)    NETFLOW=1 ;;
         --pool)       shift; POOL_END=203.0.113.${1:-4} ;;
+        --quarantine) QUARANTINE=1 ;;
         --keep)     KEEP=1 ;;
         -h|--help)  usage ;;
         *) die "unknown option: $1" ;;
@@ -156,11 +158,10 @@ run_once() {
     rules_down; mod_down; net_down; sleep 0.2
     net_up
     # cap out of the way: we are measuring session rate, not the quota
-    if [ $NETFLOW = 1 ]; then
-        mod_up user_max_sessions=65535 nf_dest=$NF_DEST || { say "${C_R}insmod failed${C_0}"; return 1; }
-    else
-        mod_up user_max_sessions=65535 || { say "${C_R}insmod failed${C_0}"; return 1; }
-    fi
+    local extra="user_max_sessions=65535"
+    [ $NETFLOW    = 1 ] && extra="$extra nf_dest=$NF_DEST"
+    [ $QUARANTINE = 1 ] && extra="$extra port_quarantine=1"
+    mod_up $extra || { say "${C_R}insmod failed${C_0}"; return 1; }
     rules_up
 
     dmac=$(ip link show xn-s0 | awk '/link\/ether/{print $2}')
