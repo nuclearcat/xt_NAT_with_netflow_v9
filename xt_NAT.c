@@ -63,6 +63,8 @@ static atomic64_t pkt_drop_nosession = ATOMIC_INIT(0);
 static atomic64_t ses_fail_ulimit = ATOMIC_INIT(0);
 static atomic64_t ses_fail_noport = ATOMIC_INIT(0);
 static atomic64_t ses_fail_nomem = ATOMIC_INIT(0);
+/* another CPU created the same session first: work done, but no new session */
+static atomic64_t sessions_dup = ATOMIC_INIT(0);
 
 static char nat_pool_buf[128] = "127.0.0.1-127.0.0.1";
 static char *nat_pool = nat_pool_buf;
@@ -153,10 +155,44 @@ struct nat_session {
     uint8_t  flags;
 };
 
+/* Dedicated caches rather than kmalloc-64. Sessions are allocated and freed
+ * constantly and in large numbers; taking them from the shared 64 byte kmalloc
+ * pool interleaves them with every other kernel user of that size, so freeing a
+ * million sessions frees very few whole slabs and the footprint never comes
+ * back. A private cache only ever holds these objects, so it can. It also makes
+ * the cost visible - "xt_NAT_session" and "xt_NAT_htent" in /proc/slabinfo -
+ * and keeps each object cacheline aligned.
+ *
+ * kfree_rcu() cannot free slab-cache objects, so the RCU callbacks are
+ * explicit. Both caches therefore need an rcu_barrier() before destruction.
+ */
+static struct kmem_cache *nat_session_cache __read_mostly;
+static struct kmem_cache *nat_htent_cache __read_mostly;
+
+static void nat_session_free_rcu(struct rcu_head *head)
+{
+    kmem_cache_free(nat_session_cache, container_of(head, struct nat_session, rcu));
+}
+
+static void nat_htent_free_rcu(struct rcu_head *head)
+{
+    kmem_cache_free(nat_htent_cache, container_of(head, struct nat_htable_ent, rcu));
+}
+
+/* objects allocated for a session that was never published */
+static inline void nat_session_discard(struct nat_session *data,
+                                       struct nat_htable_ent *a,
+                                       struct nat_htable_ent *b)
+{
+    kmem_cache_free(nat_htent_cache, b);
+    kmem_cache_free(nat_htent_cache, a);
+    kmem_cache_free(nat_session_cache, data);
+}
+
 static inline void nat_session_put(struct nat_session *data)
 {
     if (refcount_dec_and_test(&data->refcnt))
-        kfree_rcu(data, rcu);
+        call_rcu(&data->rcu, nat_session_free_rcu);
 }
 
 struct xt_users_htable {
@@ -333,7 +369,7 @@ static void nat_htable_remove(void)
             data = session->data;
             hlist_del_rcu(&session->list_node);
             ht_inner[i].use--;
-            kfree_rcu(session, rcu);
+            call_rcu(&session->rcu, nat_htent_free_rcu);
             nat_session_put(data);
         }
         if (ht_inner[i].use != 0) {
@@ -349,7 +385,7 @@ static void nat_htable_remove(void)
             data = session->data;
             hlist_del_rcu(&session->list_node);
             ht_outer[i].use--;
-            kfree_rcu(session, rcu);
+            call_rcu(&session->rcu, nat_htent_free_rcu);
             nat_session_put(data);
         }
         if (ht_outer[i].use != 0) {
@@ -671,10 +707,9 @@ static void netflow_export_flow_v9(const uint8_t proto, const u_int32_t srcaddr,
 static struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_int32_t useraddr, const uint16_t userport, const u_int32_t dstaddr, const uint16_t dstport, const u_int32_t nataddr)
 {
     unsigned int hash;
-    struct nat_htable_ent *session, *session2;
+    struct nat_htable_ent *session, *session2, *existing;
     struct nat_session *data_session;
     uint16_t natport;
-    unsigned int sz;
     unsigned int nataddr_id;
 
     atomic64_inc(&sessions_tried);
@@ -685,6 +720,29 @@ static struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_in
         return NULL;
     }
 
+    /* Allocate before taking the lock. These three allocations used to sit
+     * inside the per-NAT-address critical section, which every subscriber
+     * sharing that address serialises on; GFP_ATOMIC can still have to walk
+     * the freelists. Nothing here needs the lock, and on the rare paths that
+     * bail out the objects are simply freed - they were never published.
+     */
+    data_session = kmem_cache_zalloc(nat_session_cache, GFP_ATOMIC);
+    if (unlikely(data_session == NULL))
+        goto err_nomem;
+
+    session = kmem_cache_zalloc(nat_htent_cache, GFP_ATOMIC);
+    if (unlikely(session == NULL)) {
+        kmem_cache_free(nat_session_cache, data_session);
+        goto err_nomem;
+    }
+
+    session2 = kmem_cache_zalloc(nat_htent_cache, GFP_ATOMIC);
+    if (unlikely(session2 == NULL)) {
+        kmem_cache_free(nat_htent_cache, session);
+        kmem_cache_free(nat_session_cache, data_session);
+        goto err_nomem;
+    }
+
     nataddr_id = ntohl(nataddr) - ntohl(nat_pool_start);
     spin_lock_bh(&create_session_lock[nataddr_id]);
 
@@ -692,13 +750,15 @@ static struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_in
      * session with rcu_read_lock_bh() held for it to drop.
      */
     rcu_read_lock_bh();
-    session = lookup_session(ht_inner, proto, useraddr, userport);
-    if(unlikely(session)) {
+    existing = lookup_session(ht_inner, proto, useraddr, userport);
+    if (unlikely(existing)) {
         spin_unlock_bh(&create_session_lock[nataddr_id]);
-        session = lookup_session(ht_outer, proto, nataddr, session->data->out_port);
-        if (unlikely(session == NULL))
+        nat_session_discard(data_session, session, session2);
+        existing = lookup_session(ht_outer, proto, nataddr, existing->data->out_port);
+        if (unlikely(existing == NULL))
             rcu_read_unlock_bh();
-        return session;
+        atomic64_inc(&sessions_dup);
+        return existing;
     }
     rcu_read_unlock_bh();
 
@@ -710,43 +770,11 @@ static struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_in
             atomic64_inc(&ses_fail_noport);
             printk_ratelimited(KERN_WARNING "xt_NAT create_nat_session ERROR: Not found free nat port for %d %pI4:%u -> %pI4:XXXX\n", proto, &useraddr, userport, &nataddr);
             spin_unlock_bh(&create_session_lock[nataddr_id]);
+            nat_session_discard(data_session, session, session2);
             return NULL;
         }
     } else {
         natport = userport;
-    }
-
-    sz = sizeof(struct nat_session);
-    data_session = kzalloc(sz, GFP_ATOMIC);
-
-    if (unlikely(data_session == NULL)) {
-        atomic64_inc(&ses_fail_nomem);
-        printk_ratelimited(KERN_WARNING "xt_NAT create_nat_session ERROR: Cannot allocate memory for data_session\n");
-        spin_unlock_bh(&create_session_lock[nataddr_id]);
-        return NULL;
-    }
-
-    sz = sizeof(struct nat_htable_ent);
-    session = kzalloc(sz, GFP_ATOMIC);
-
-    if (unlikely(session == NULL)) {
-        atomic64_inc(&ses_fail_nomem);
-        printk_ratelimited(KERN_WARNING "xt_NAT ERROR: Cannot allocate memory for ht_inner session\n");
-        kfree(data_session);
-        spin_unlock_bh(&create_session_lock[nataddr_id]);
-        return NULL;
-    }
-
-    sz = sizeof(struct nat_htable_ent);
-    session2 = kzalloc(sz, GFP_ATOMIC);
-
-    if (unlikely(session2 == NULL)) {
-        atomic64_inc(&ses_fail_nomem);
-        printk_ratelimited(KERN_WARNING "xt_NAT ERROR: Cannot allocate memory for ht_outer session\n");
-        kfree(data_session);
-        kfree(session);
-        spin_unlock_bh(&create_session_lock[nataddr_id]);
-        return NULL;
     }
 
     /* one reference for the ht_inner entry, one for the ht_outer entry */
@@ -790,11 +818,17 @@ static struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_in
 
     atomic64_inc(&sessions_created);
     atomic64_inc(&sessions_active);
+
+    /* session2 is the entry just published into ht_outer under exactly these
+     * keys; re-looking it up walked the hash to find what we already hold.
+     */
     rcu_read_lock_bh();
-    session = lookup_session(ht_outer, proto, nataddr, natport);
-    if (unlikely(session == NULL))
-        rcu_read_unlock_bh();
-    return session;
+    return session2;
+
+err_nomem:
+    atomic64_inc(&ses_fail_nomem);
+    printk_ratelimited(KERN_WARNING "xt_NAT create_nat_session ERROR: Cannot allocate session\n");
+    return NULL;
 }
 
 static unsigned int
@@ -1373,7 +1407,7 @@ static void sessions_cleanup_timer_callback( struct timer_list *timer )
 
                     hlist_del_rcu(&session->list_node);
                     ht_inner[i].use--;
-                    kfree_rcu(session, rcu);
+                    call_rcu(&session->rcu, nat_htent_free_rcu);
                     nat_session_put(data);
                     update_user_limits(proto, addr, -1);
                 }
@@ -1391,7 +1425,7 @@ static void sessions_cleanup_timer_callback( struct timer_list *timer )
                     data = session->data;
                     hlist_del_rcu(&session->list_node);
                     ht_outer[i].use--;
-                    kfree_rcu(session, rcu);
+                    call_rcu(&session->rcu, nat_htent_free_rcu);
                     nat_session_put(data);
                     atomic64_dec(&sessions_active);
                 }
@@ -1542,6 +1576,7 @@ static int stat_seq_show(struct seq_file *m, void *v)
     seq_printf(m, "Active NAT sessions: %lld\n", atomic64_read(&sessions_active));
     seq_printf(m, "Tried NAT sessions: %lld\n", atomic64_read(&sessions_tried));
     seq_printf(m, "Created NAT sessions: %lld\n", atomic64_read(&sessions_created));
+    seq_printf(m, "Raced session creates: %lld\n", atomic64_read(&sessions_dup));
     seq_printf(m, "DNAT dropped pkts: %lld\n", atomic64_read(&dnat_dropped));
     seq_printf(m, "Fragmented pkts: %lld\n", atomic64_read(&frags));
     seq_printf(m, "Related ICMP pkts: %lld\n", atomic64_read(&related_icmp));
@@ -1738,6 +1773,23 @@ static int __init nat_tg_init(void)
     printk(KERN_INFO "xt_NAT DEBUG: NAT hash size: %d\n", nat_hash_size);
     printk(KERN_INFO "xt_NAT DEBUG: Users hash size: %d\n", users_hash_size);
 
+    /* No SLAB_HWCACHE_ALIGN: it rounds the 40 byte session and the 56 byte
+     * hash entry both up to 64, which is exactly what kmalloc-64 already did -
+     * all of the padding, none of the benefit. At natural alignment the three
+     * objects a session needs are 152 bytes rather than 192, 21% less, and
+     * more of them fit in a page so the cache grows in fewer page allocations.
+     */
+    nat_session_cache = kmem_cache_create("xt_NAT_session",
+                                          sizeof(struct nat_session), 0,
+                                          0, NULL);
+    nat_htent_cache = kmem_cache_create("xt_NAT_htent",
+                                        sizeof(struct nat_htable_ent), 0,
+                                        0, NULL);
+    if (!nat_session_cache || !nat_htent_cache) {
+        ret = -ENOMEM;
+        goto err_caches;
+    }
+
     ret = nat_htable_create();
     if (ret < 0)
         goto err_tables;
@@ -1781,6 +1833,12 @@ err_tables:
     pool_table_remove();
     users_htable_remove();
     nat_htable_remove();
+err_caches:
+    /* nothing has been published yet, so no RCU callbacks can be outstanding */
+    kmem_cache_destroy(nat_session_cache);
+    kmem_cache_destroy(nat_htent_cache);
+    nat_session_cache = NULL;
+    nat_htent_cache = NULL;
     printk(KERN_ERR "xt_NAT ERROR: module load failed, error %d\n", ret);
     return ret;
 }
@@ -1798,6 +1856,14 @@ static void __exit nat_tg_exit(void)
     nat_htable_remove();
 
     nf_destinations_remove();
+
+    /* the tables were torn down with call_rcu(); those callbacks must have run
+     * before the caches they free into can be destroyed */
+    rcu_barrier();
+    kmem_cache_destroy(nat_session_cache);
+    kmem_cache_destroy(nat_htent_cache);
+    nat_session_cache = NULL;
+    nat_htent_cache = NULL;
 
     printk(KERN_INFO "Module xt_NAT unloaded\n");
 }
