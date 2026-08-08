@@ -91,11 +91,15 @@ dmesg_mark() { DMESG_MARK=$(dmesg 2>/dev/null | wc -l); }
 
 # Anything here means the kernel is unhappy. "bad use value" and "session count
 # underflow" are the module's own consistency complaints and count too.
+#
+# \b matters on the first two: the module prints "xt_NAT DEBUG:" and
+# "... ERROR: ..." constantly, and an unanchored BUG: matches every DEBUG:
+# line, which turned every ordinary load into a fake splat.
 DMESG_BAD=(
-    'BUG:' 'WARNING:' 'KASAN' 'UBSAN' 'Oops' 'general protection'
+    '\bBUG:' 'WARNING:' 'KASAN' 'UBSAN' '\bOops' 'general protection'
     'kernel NULL pointer' 'INFO: possible' 'possible circular'
     'suspicious RCU' 'RCU-list' 'scheduling while atomic'
-    'list_add' 'list_del' 'refcount_t' 'use-after-free'
+    'list_add corruption' 'list_del corruption' 'refcount_t' 'use-after-free'
     'slab-out-of-bounds' 'stack-out-of-bounds' 'soft lockup' 'hard LOCKUP'
     'bad use value' 'session count underflow'
 )
@@ -133,11 +137,18 @@ check_env() {
         local virt="none"
         need systemd-detect-virt && virt=$(systemd-detect-virt 2>/dev/null || echo none)
         if [ "$virt" = none ] && ! grep -qi 'qemu\|kvm\|bochs' /sys/class/dmi/id/sys_vendor 2>/dev/null; then
-            say "This does not look like a VM."
-            say "It will insmod an out-of-tree NAT module and flush your iptables rules."
-            say "Set XT_NAT_TEST_FORCE=1 if you really mean it."
+            say "This does not look like a VM ($(cat /sys/class/dmi/id/sys_vendor 2>/dev/null), uptime $(cut -d. -f1 /proc/uptime)s)."
+            say ""
+            say "This test insmods an out-of-tree NAT module that rewrites packet"
+            say "headers, and adds rules to the live raw/PREROUTING and FORWARD"
+            say "chains. A bug in the module is a kernel bug, on this kernel."
+            say ""
+            say "Run it in a throwaway VM:  $0 --vng /path/to/linux"
+            say "Override only if you mean it:  XT_NAT_TEST_FORCE=1 $0"
             exit 1
         fi
+    else
+        say "${C_Y}XT_NAT_TEST_FORCE is set - running against the live kernel.${C_0}"
     fi
 
     # Where to find libxt_NAT.so. Prefer the build directory so the test does
@@ -222,21 +233,32 @@ net_down() {
     ip link del xn-i0 2>/dev/null
 }
 
+# Insert at the head of each chain rather than appending, so an existing DROP
+# further down cannot shadow us - and delete exactly what we inserted rather
+# than flushing. Never touch the chain policies. If this ever runs somewhere
+# it should not, it must not take the host's firewall with it.
 rules_up() {
-    ipt -t raw -A PREROUTING -s $SUB_NET.0/24 -j CT --notrack
-    ipt -t raw -A PREROUTING -d $POOL_NET -j CT --notrack
-    ipt -t raw -A PREROUTING -d $POOL_NET -j NAT --dnat
-    ipt -A FORWARD -s $SUB_NET.0/24 -o xn-i0 -j NAT --snat
-    ipt -P FORWARD ACCEPT
+    ipt -t raw -I PREROUTING 1 -s $SUB_NET.0/24 -j CT --notrack
+    ipt -t raw -I PREROUTING 1 -d $POOL_NET -j CT --notrack
+    ipt -t raw -I PREROUTING 1 -d $POOL_NET -j NAT --dnat
+    # return direction is DNATed in raw, then traverses FORWARD normally
+    ipt -I FORWARD 1 -i xn-i0 -o xn-s0 -d $SUB_NET.0/24 -j ACCEPT
+    # the NAT target is terminating for what it accepts, so it goes first
+    ipt -I FORWARD 1 -s $SUB_NET.0/24 -o xn-i0 -j NAT --snat
 }
 
 rules_down() {
-    ipt -t raw -F PREROUTING 2>/dev/null
-    ipt -F FORWARD 2>/dev/null
+    ipt -D FORWARD -s $SUB_NET.0/24 -o xn-i0 -j NAT --snat 2>/dev/null
+    ipt -D FORWARD -i xn-i0 -o xn-s0 -d $SUB_NET.0/24 -j ACCEPT 2>/dev/null
+    ipt -t raw -D PREROUTING -d $POOL_NET -j NAT --dnat 2>/dev/null
+    ipt -t raw -D PREROUTING -d $POOL_NET -j CT --notrack 2>/dev/null
+    ipt -t raw -D PREROUTING -s $SUB_NET.0/24 -j CT --notrack 2>/dev/null
+    return 0
 }
 
-mod_up()   { insmod "$MODULE" nat_pool=$POOL_START-$POOL_END "$@"; }
-mod_down() { rmmod xt_NAT 2>/dev/null; }
+mod_up()       { insmod "$MODULE" nat_pool=$POOL_START-$POOL_END "$@"; }
+mod_down()     { rmmod xt_NAT 2>/dev/null; return 0; }
+module_loaded() { [ -d /proc/net/NAT ]; }
 
 cleanup() {
     [ "$KEEP" = 1 ] && { say "--keep: leaving topology up"; return; }
@@ -536,12 +558,16 @@ t_bad_params() {
         mod_up; rules_up; return
     fi
 
-    # nat_hash_size=0 makes kzalloc() return ZERO_SIZE_PTR, which is not NULL:
-    # known to be unguarded, so this is informational until it is fixed.
-    if insmod "$MODULE" nat_pool=$POOL_START-$POOL_END nat_hash_size=0 2>/dev/null; then
-        info "note: nat_hash_size=0 was accepted (unvalidated module param)"
-        rmmod xt_NAT 2>/dev/null
-    fi
+    # nat_hash_size=0 makes kzalloc() return ZERO_SIZE_PTR, which is not NULL,
+    # so the allocation check passes and the first lookup dereferences it
+    local bad
+    for bad in "nat_hash_size=0" "nat_hash_size=-1" "users_hash_size=0"; do
+        if insmod "$MODULE" nat_pool=$POOL_START-$POOL_END $bad 2>/dev/null; then
+            rmmod xt_NAT 2>/dev/null
+            fail "$n" "$bad was accepted"
+            mod_up; rules_up; return
+        fi
+    done
 
     mod_up || { fail "$n" "could not reload module"; return; }
     rules_up
@@ -573,7 +599,12 @@ t_reload_cycles() {
     for i in $(seq 1 $cycles); do
         rules_down
         mod_down
-        mod_up || { fail "$n" "insmod failed on cycle $i"; return; }
+        if ! mod_up 2>"$TMPD/err"; then
+            fail "$n" "insmod failed on cycle $i: $(head -1 "$TMPD/err")"
+            info "check /proc/buddyinfo - the tables are large allocations"
+            mod_up 2>/dev/null && rules_up      # leave the rig usable
+            return
+        fi
         rules_up
         ip netns exec $NS_SUB python3 "$TMPD/udp_cli.py" $INET_NET.2 >/dev/null 2>&1
     done
@@ -603,19 +634,21 @@ t_rmmod_under_load() {
     # The teardown used to call del_timer_sync() while holding the lock the
     # timer callback takes. If that regresses, this hangs rather than fails.
     local n="rmmod completes while the GC timer is busy"
+    module_loaded || { skip "$n" "module not loaded"; return; }
     dmesg_mark
     ip netns exec $NS_SUB python3 "$TMPD/flood.py" $INET_NET.2 6 >/dev/null 2>&1 &
     local fl=$!
     sleep 2
     rules_down
-    if timeout 30 rmmod xt_NAT; then
-        kill $fl 2>/dev/null; wait $fl 2>/dev/null
-        mod_up; rules_up
-        dmesg_check "$n" && pass "$n"
-    else
-        kill $fl 2>/dev/null
-        fail "$n" "rmmod did not complete within 30s (deadlock?)"
-    fi
+    timeout 30 rmmod xt_NAT 2>"$TMPD/err"
+    local rc=$?
+    kill $fl 2>/dev/null; wait $fl 2>/dev/null
+    case $rc in
+        0)   mod_up; rules_up; dmesg_check "$n" && pass "$n" ;;
+        124) fail "$n" "rmmod did not complete within 30s - deadlock" ;;
+        *)   fail "$n" "rmmod failed: $(head -1 "$TMPD/err")"
+             mod_up 2>/dev/null && rules_up ;;
+    esac
 }
 
 t_aging() {
