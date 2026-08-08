@@ -29,6 +29,20 @@ per user per protocol (default 4096, max 65535). It is writable at runtime via
 * No ALGs/helpers (FTP/SIP/PPTP/etc.) are implemented.
 * For non-TCP/UDP/ICMP protocols, mapping is per-user+proto (port=0), so distinct flows of the same protocol are not separated.
 
+## Testing
+
+Functional tests, memory/locking checks under KASAN and lockdep, and the
+session-rate benchmark all run in a throwaway VM:
+
+```
+$ ./run-vm.sh                          # functional suite, ~33s warm
+$ ./run-vm.sh --kdir /path/to/linux    # same, under KASAN + lockdep
+$ ./run-vm.sh --bench                  # + session setup rate
+```
+
+See [TESTING.md](TESTING.md) for what each mode proves, how to build a suitable
+debug kernel, the benchmark modes, and the current performance baseline.
+
 ## Installation
 ```
 $ make
