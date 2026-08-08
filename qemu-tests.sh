@@ -438,6 +438,44 @@ t_icmp_malformed() {
     esac
 }
 
+t_named_pools() {
+    local n="named pools: --pool selects, unknown name is refused"
+    dmesg_mark
+    rules_down; mod_down; sleep 0.3
+
+    # two pools, the second deterministic, in one nat_pool string
+    if ! insmod "$MODULE" \
+         nat_pool="alpha:$POOL_START-$POOL_END,beta:203.0.113.100-203.0.113.163:10.0.0.0/20:1008" \
+         2>"$TMPD/err"; then
+        fail "$n" "insmod with two pools failed: $(head -1 "$TMPD/err")"
+        mod_up 2>/dev/null; rules_up; return
+    fi
+
+    if ! grep -q "^pool alpha" /proc/net/CGNAT/pools || ! grep -q "^pool beta" /proc/net/CGNAT/pools; then
+        fail "$n" "both pools should appear in /proc/net/CGNAT/pools"
+        mod_down; mod_up; rules_up; return
+    fi
+
+    # a rule naming a pool that does not exist must be refused
+    if ipt -I FORWARD 1 -s $SUB_CIDR -o xn-i0 -j CGNAT --snat --pool nosuch 2>/dev/null; then
+        ipt -D FORWARD -s $SUB_CIDR -o xn-i0 -j CGNAT --snat --pool nosuch 2>/dev/null
+        fail "$n" "a rule naming an unknown pool was accepted"
+        mod_down; mod_up; rules_up; return
+    fi
+
+    # traffic through the named pool must be translated from that pool's range
+    POOL_OPT="--pool alpha" rules_up
+    local got
+    got=$(ip netns exec $NS_SUB python3 "$TMPD/udp_cli.py" $INET_NET.2)
+    POOL_OPT="--pool alpha" rules_down
+    mod_down; mod_up; rules_up
+
+    case "$got" in
+        $POOL_PREFIX*) dmesg_check "$n" && pass "$n" && info "via pool alpha, server saw $got" ;;
+        *)             fail "$n" "server saw '$got' through pool alpha" ;;
+    esac
+}
+
 t_target_validation() {
     local n="rule without --snat/--dnat is rejected"
     dmesg_mark
@@ -669,6 +707,7 @@ t_tables
 t_icmp_error
 t_icmp_malformed
 t_target_validation
+t_named_pools
 t_capture
 t_bad_params
 t_reload_cycles

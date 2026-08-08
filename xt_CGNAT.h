@@ -6,8 +6,17 @@ enum xt_cgnat_target_variant {
     XT_CGNAT_DNAT,
 };
 
+#define XT_CGNAT_POOL_NAMELEN 16
+
 struct xt_cgnat_tginfo {
     uint8_t variant;
+    char    pool[XT_CGNAT_POOL_NAMELEN];    /* empty = the first pool */
+
+    /* Resolved once by checkentry so the packet path does not look a name up
+     * per packet. Kernel only: .usersize stops it being compared or shown by
+     * userspace, which is the same trick xt_hashlimit and friends use.
+     */
+    void *priv __attribute__((aligned(8)));
 };
 
 #define NETFLOW9_RECORDS_MAX 30

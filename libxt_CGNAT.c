@@ -9,11 +9,13 @@
 enum {
     F_SNAT  = 1 << 0,
     F_DNAT  = 1 << 1,
+    F_POOL  = 1 << 2,
 };
 
 static const struct option nat_tg_opts[] = {
     {.name = "snat", .has_arg = false, .val = 's'},
     {.name = "dnat", .has_arg = false, .val = 'd'},
+    {.name = "pool", .has_arg = true,  .val = 'p'},
     {NULL},
 };
 
@@ -22,7 +24,10 @@ static void nat_tg_help(void)
     printf(
         "CGNAT target options:\n"
         "  --snat    Create CGNAT translation from Inside to Outside\n"
-        "  --dnat    Allow CGNAT for revert traffic from Outside to Inside\n");
+        "  --dnat    Allow CGNAT for revert traffic from Outside to Inside\n"
+        "  --pool <name>\n"
+        "            Use the named pool from the nat_pool module parameter.\n"
+        "            Omit for the first pool.\n");
 }
 
 static int nat_tg_parse(int c, char **argv, int invert, unsigned int *flags,
@@ -38,6 +43,15 @@ static int nat_tg_parse(int c, char **argv, int invert, unsigned int *flags,
     case 'd':
         info->variant = XT_CGNAT_DNAT;
         *flags |= F_DNAT;
+        return true;
+    case 'p':
+        if (strlen(optarg) >= XT_CGNAT_POOL_NAMELEN)
+            xtables_error(PARAMETER_PROBLEM,
+                          "CGNAT: pool name is limited to %d characters",
+                          XT_CGNAT_POOL_NAMELEN - 1);
+        strncpy(info->pool, optarg, XT_CGNAT_POOL_NAMELEN - 1);
+        info->pool[XT_CGNAT_POOL_NAMELEN - 1] = '\0';
+        *flags |= F_POOL;
         return true;
     }
     return false;
@@ -66,6 +80,9 @@ static void nat_tg_save(const void *ip,
         printf(" --dnat ");
         break;
     }
+    /* must be emitted, or iptables-save loses which pool the rule used */
+    if (info->pool[0])
+        printf(" --pool %s ", info->pool);
 }
 
 static void nat_tg_print(const void *ip,

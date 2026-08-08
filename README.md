@@ -43,6 +43,32 @@ per user per protocol (default 4096, max 65535). It is writable at runtime via
 * No ALGs/helpers (FTP/SIP/PPTP/etc.) are implemented.
 * For non-TCP/UDP/ICMP protocols, mapping is per-user+proto (port=0), so distinct flows of the same protocol are not separated.
 
+## Pools
+
+`nat_pool` defines one or more pools, comma separated, and a rule picks one:
+
+```
+# one unnamed pool, as before
+modprobe xt_CGNAT nat_pool=203.0.113.1-203.0.113.4
+iptables -A FORWARD -s 10.0.0.0/16 -j CGNAT --snat
+
+# several, one of them deterministic
+modprobe xt_CGNAT nat_pool="retail:203.0.113.1-203.0.113.64,\
+biz:198.51.100.1-198.51.100.64:10.20.0.0/20:1008"
+iptables -A FORWARD -s 10.0.0.0/16  -j CGNAT --snat --pool retail
+iptables -A FORWARD -s 10.20.0.0/20 -j CGNAT --snat --pool biz
+iptables -t raw -A PREROUTING -d 203.0.113.0/24 -j CGNAT --dnat --pool retail
+iptables -t raw -A PREROUTING -d 198.51.100.0/24 -j CGNAT --dnat --pool biz
+```
+
+Up to 8 pools. Names must be unique and ranges must not overlap - both are
+refused at load. Omitting `--pool` selects the first. Per-pool configuration
+and counters are in `/proc/net/CGNAT/pools`; `statistics` shows the totals.
+
+Note `/proc/net/CGNAT/users` no longer prints a NAT address: with several pools
+a subscriber's public address depends on which rule matched, and that table is
+keyed only on the private address. `sessions` has the real mapping.
+
 ## Migrating from xt_NAT
 
 The rename is not backward compatible. Everything user-visible changed:

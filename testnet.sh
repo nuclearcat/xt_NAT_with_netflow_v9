@@ -95,17 +95,17 @@ net_down() {
 rules_up() {
     ipt -t raw -I PREROUTING 1 -s $SUB_CIDR -j CT --notrack
     ipt -t raw -I PREROUTING 1 -d $POOL_NET -j CT --notrack
-    ipt -t raw -I PREROUTING 1 -d $POOL_NET -j CGNAT --dnat
+    ipt -t raw -I PREROUTING 1 -d $POOL_NET -j CGNAT --dnat ${POOL_OPT:-}
     # return direction is DNATed in raw, then traverses FORWARD normally
     ipt -I FORWARD 1 -i xn-i0 -o xn-s0 -d $SUB_CIDR -j ACCEPT
     # the NAT target is terminating for what it accepts, so it goes first
-    ipt -I FORWARD 1 -s $SUB_CIDR -o xn-i0 -j CGNAT --snat
+    ipt -I FORWARD 1 -s $SUB_CIDR -o xn-i0 -j CGNAT --snat ${POOL_OPT:-}
 }
 
 rules_down() {
-    ipt -D FORWARD -s $SUB_CIDR -o xn-i0 -j CGNAT --snat 2>/dev/null
+    ipt -D FORWARD -s $SUB_CIDR -o xn-i0 -j CGNAT --snat ${POOL_OPT:-} 2>/dev/null
     ipt -D FORWARD -i xn-i0 -o xn-s0 -d $SUB_CIDR -j ACCEPT 2>/dev/null
-    ipt -t raw -D PREROUTING -d $POOL_NET -j CGNAT --dnat 2>/dev/null
+    ipt -t raw -D PREROUTING -d $POOL_NET -j CGNAT --dnat ${POOL_OPT:-} 2>/dev/null
     ipt -t raw -D PREROUTING -d $POOL_NET -j CT --notrack 2>/dev/null
     ipt -t raw -D PREROUTING -s $SUB_CIDR -j CT --notrack 2>/dev/null
     return 0
@@ -126,7 +126,7 @@ preload_deps() {
     return 0
 }
 
-mod_up()        { insmod "$MODULE" nat_pool=$POOL_START-$POOL_END "$@"; }
+mod_up()        { insmod "$MODULE" nat_pool="${NAT_POOL_SPEC:-$POOL_START-$POOL_END}" "$@"; }
 mod_down()      { rmmod xt_CGNAT 2>/dev/null; return 0; }
 module_loaded() { [ -d /proc/net/CGNAT ]; }
 
