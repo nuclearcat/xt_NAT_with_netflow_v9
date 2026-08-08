@@ -16,6 +16,7 @@
 #   ./bench-cps.sh --senders 4         one generator process per core
 #   ./bench-cps.sh --pool-sweep        1, 2, 4, 8, 16 NAT addresses
 #   ./bench-cps.sh --gc-cost           what the GC costs at rest, vs table size
+#   ./bench-cps.sh --netflow           with a collector attached, as deployed
 #
 # READ THIS BEFORE QUOTING A NUMBER. In a VM, over veth, this measures a
 # software path on a virtual CPU. The absolute figure is meaningless as a
@@ -41,6 +42,7 @@ SENDERS=0            # 0 = one per online cpu, capped at 4
 N_SRC_IPS=2000
 SWEEP=0
 GCCOST=0
+NETFLOW=0
 KEEP=0
 
 if [ -t 1 ]; then
@@ -62,6 +64,7 @@ while [ $# -gt 0 ]; do
         --src-ips)  shift; N_SRC_IPS=${1:-2000} ;;
         --pool-sweep) SWEEP=1 ;;
         --gc-cost)    GCCOST=1 ;;
+        --netflow)    NETFLOW=1 ;;
         --keep)     KEEP=1 ;;
         -h|--help)  usage ;;
         *) die "unknown option: $1" ;;
@@ -91,7 +94,39 @@ int_from_ip() { local IFS=.; set -- $1; echo $(( ($1<<24)|($2<<16)|($3<<8)|$4 ))
 ip_from_int() { printf '%d.%d.%d.%d' $(( ($1>>24)&255 )) $(( ($1>>16)&255 )) $(( ($1>>8)&255 )) $(( $1&255 )); }
 SRC_BASE=$(int_from_ip "$SUB_NET.10")
 
+# Every measurement so far ran with no nf_dest, so netflow_sendmsg() walked an
+# empty list: the global nfsend_lock and the record write were paid, the actual
+# kernel_sendmsg() every 30 records was not. Nobody deploys it that way.
+NF_DEST=127.0.0.1:2055
+collector_start() {
+    [ $NETFLOW = 1 ] || return 0
+    cat >"$TMPD/collector.py" <<'EOF'
+import socket, sys, signal
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 << 20)
+s.bind(('127.0.0.1', 2055))
+s.settimeout(1)
+n, out, run = 0, sys.argv[1], [True]
+signal.signal(signal.SIGTERM, lambda *a: run.__setitem__(0, False))
+while run[0]:
+    try:
+        s.recvfrom(65535); n += 1
+    except socket.timeout:
+        open(out, 'w').write(str(n))
+open(out, 'w').write(str(n))
+EOF
+    python3 "$TMPD/collector.py" "$TMPD/nfcount" >/dev/null 2>&1 &
+    COLLECTOR=$!
+    sleep 0.5
+}
+collector_stop() {
+    [ -n "${COLLECTOR:-}" ] || return 0
+    kill "$COLLECTOR" 2>/dev/null; wait "$COLLECTOR" 2>/dev/null
+    COLLECTOR=""
+}
+
 cleanup() {
+    collector_stop
     [ $KEEP = 1 ] && { say "--keep: leaving topology up"; return; }
     rules_down; mod_down; net_down; rm -rf "$TMPD"
 }
@@ -117,7 +152,11 @@ run_once() {
     rules_down; mod_down; net_down; sleep 0.2
     net_up
     # cap out of the way: we are measuring session rate, not the quota
-    mod_up user_max_sessions=65535 || { say "${C_R}insmod failed${C_0}"; return 1; }
+    if [ $NETFLOW = 1 ]; then
+        mod_up user_max_sessions=65535 nf_dest=$NF_DEST || { say "${C_R}insmod failed${C_0}"; return 1; }
+    else
+        mod_up user_max_sessions=65535 || { say "${C_R}insmod failed${C_0}"; return 1; }
+    fi
     rules_up
 
     dmac=$(ip link show xn-s0 | awk '/link\/ether/{print $2}')
@@ -200,6 +239,11 @@ info "kernel:    $(uname -r)"
 info "senders:   $SENDERS x ${DURATION}s, $N_SRC_IPS source addresses"
 info "module:    $MODULE"
 
+if [ $NETFLOW = 1 ]; then
+    info "netflow:   exporting to $NF_DEST"
+    collector_start
+fi
+
 say ""
 say "compiling generator"
 gcc -O2 -o "$GEN" "$SRCDIR/cps-gen.c" || die "could not build cps-gen.c"
@@ -258,6 +302,13 @@ else
         say "  no session creation failures: the generator, not the NAT, was"
         say "  the limit. Raise --senders or --duration to push harder."
     fi
+fi
+
+if [ $NETFLOW = 1 ]; then
+    collector_stop
+    say ""
+    say "NetFlow v9 packets received by the collector: $(cat "$TMPD/nfcount" 2>/dev/null || echo 0)"
+    say "(zero would mean the export never happened and the comparison is void)"
 fi
 
 say ""
