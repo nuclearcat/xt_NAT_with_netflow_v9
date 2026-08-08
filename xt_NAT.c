@@ -13,7 +13,6 @@
 #include <linux/inet.h>
 #include <linux/proc_fs.h>
 #include <linux/mm.h>
-#include <linux/refcount.h>
 #include <net/tcp.h>
 #include "compat.h"
 #include "xt_NAT.h"
@@ -128,71 +127,52 @@ struct xt_nat_htable {
     struct hlist_head session;
 };
 
-struct nat_htable_ent {
-    struct rcu_head rcu;
-    struct hlist_node list_node;
-    uint8_t  proto;
-    uint32_t addr;
-    uint16_t port;
-    struct nat_session *data;
-};
-
-/* One nat_session is shared by the two nat_htable_ent that point at it, one
- * in ht_inner and one in ht_outer. They live in unrelated buckets and are
- * unlinked independently by the GC, so the session is refcounted and freed
- * once the second entry is gone - deferred, because RCU readers may still be
- * walking either chain.
+/* One object per session, linked into both hash tables at once. 64 bytes -
+ * exactly one cacheline, so a lookup touches a single line rather than an
+ * entry plus a pointer chase to a second object elsewhere in memory. This was
+ * three allocations totalling 152 bytes.
+ *
+ * The union is what makes it fit. rcu_head is only used once the session has
+ * been unlinked from both tables and can no longer be found by anyone, and the
+ * only fields it overlays are the NetFlow destination - which the GC reads for
+ * the session-close record one sweep *before* the unlink. No reader in the
+ * packet path or in /proc ever looks at dst, so none can see it overwritten.
+ * Overlaying anything else here would be a use-after-free.
  */
 struct nat_session {
-    struct rcu_head rcu;
-    refcount_t refcnt;
+    union {
+        struct rcu_head rcu;            /* valid only after the final unlink */
+        struct {
+            uint32_t addr;              /* NetFlow: original destination */
+            uint16_t port;
+        } dst;
+    } u;
+    struct hlist_node inner_node;       /* keyed (proto, in_addr, in_port)   */
+    struct hlist_node outer_node;       /* keyed (proto, nat_addr, out_port) */
     uint32_t in_addr;
-    uint32_t dst_addr;
-    uint16_t dst_port;
+    uint32_t nat_addr;
     uint16_t in_port;
     uint16_t out_port;
     int16_t  timeout;
+    uint8_t  proto;
     uint8_t  flags;
 };
 
-/* Dedicated caches rather than kmalloc-64. Sessions are allocated and freed
- * constantly and in large numbers; taking them from the shared 64 byte kmalloc
- * pool interleaves them with every other kernel user of that size, so freeing a
- * million sessions frees very few whole slabs and the footprint never comes
- * back. A private cache only ever holds these objects, so it can. It also makes
- * the cost visible - "xt_NAT_session" and "xt_NAT_htent" in /proc/slabinfo -
- * and keeps each object cacheline aligned.
+/* A private cache, not the shared kmalloc pool: sessions are allocated and
+ * freed constantly and in large numbers, and interleaving them with every
+ * other kernel user of that size means freeing them returns few whole slabs.
+ * At exactly 64 bytes SLAB_HWCACHE_ALIGN adds no padding at all, so every
+ * session comes out cacheline aligned for free.
  *
- * kfree_rcu() cannot free slab-cache objects, so the RCU callbacks are
- * explicit. Both caches therefore need an rcu_barrier() before destruction.
+ * kfree_rcu() cannot free slab-cache objects, so the callback is explicit and
+ * teardown needs an rcu_barrier() before kmem_cache_destroy().
  */
 static struct kmem_cache *nat_session_cache __read_mostly;
-static struct kmem_cache *nat_htent_cache __read_mostly;
 
 static void nat_session_free_rcu(struct rcu_head *head)
 {
-    kmem_cache_free(nat_session_cache, container_of(head, struct nat_session, rcu));
-}
-
-static void nat_htent_free_rcu(struct rcu_head *head)
-{
-    kmem_cache_free(nat_htent_cache, container_of(head, struct nat_htable_ent, rcu));
-}
-
-/* objects allocated for a session that was never published */
-static inline void nat_session_discard(struct nat_session *data,
-                                       struct nat_htable_ent *a,
-                                       struct nat_htable_ent *b)
-{
-    kmem_cache_free(nat_htent_cache, b);
-    kmem_cache_free(nat_htent_cache, a);
-    kmem_cache_free(nat_session_cache, data);
-}
-
-static inline void nat_session_put(struct nat_session *data)
-{
-    if (refcount_dec_and_test(&data->refcnt))
-        call_rcu(&data->rcu, nat_session_free_rcu);
+    kmem_cache_free(nat_session_cache,
+                    container_of(head, struct nat_session, u.rcu));
 }
 
 struct xt_users_htable {
@@ -348,11 +328,9 @@ static void users_htable_remove(void)
 
 static void nat_htable_remove(void)
 {
-    struct nat_htable_ent *session;
-    struct hlist_head *head;
+    struct nat_session *sess;
     struct hlist_node *next;
-    struct nat_session *data;
-    unsigned int i;
+    unsigned int i, ohash;
 
     if (ht_inner == NULL || ht_outer == NULL) {
         kvfree(ht_inner);
@@ -362,36 +340,29 @@ static void nat_htable_remove(void)
         return;
     }
 
+    /* A session is one object in two chains, so walking ht_inner reaches all
+     * of them; the outer chain is unlinked from the same place. */
     for (i = 0; i < nat_hash_size; i++) {
         spin_lock_bh(&ht_inner[i].lock);
-        head = &ht_inner[i].session;
-        hlist_for_each_entry_safe(session, next, head, list_node) {
-            data = session->data;
-            hlist_del_rcu(&session->list_node);
+        hlist_for_each_entry_safe(sess, next, &ht_inner[i].session, inner_node) {
+            ohash = get_hash_nat_ent(sess->proto, sess->nat_addr, sess->out_port);
+            spin_lock_bh(&ht_outer[ohash].lock);
+            hlist_del_rcu(&sess->outer_node);
+            ht_outer[ohash].use--;
+            spin_unlock_bh(&ht_outer[ohash].lock);
+
+            hlist_del_rcu(&sess->inner_node);
             ht_inner[i].use--;
-            call_rcu(&session->rcu, nat_htent_free_rcu);
-            nat_session_put(data);
+            call_rcu(&sess->u.rcu, nat_session_free_rcu);
         }
-        if (ht_inner[i].use != 0) {
+        if (ht_inner[i].use != 0)
             printk(KERN_WARNING "xt_NAT nat_htable_remove inner ERROR: bad use value: %u in element %d\n", ht_inner[i].use, i);
-        }
         spin_unlock_bh(&ht_inner[i].lock);
     }
 
     for (i = 0; i < nat_hash_size; i++) {
-        spin_lock_bh(&ht_outer[i].lock);
-        head = &ht_outer[i].session;
-        hlist_for_each_entry_safe(session, next, head, list_node) {
-            data = session->data;
-            hlist_del_rcu(&session->list_node);
-            ht_outer[i].use--;
-            call_rcu(&session->rcu, nat_htent_free_rcu);
-            nat_session_put(data);
-        }
-        if (ht_outer[i].use != 0) {
+        if (ht_outer[i].use != 0)
             printk(KERN_WARNING "xt_NAT nat_htable_remove outer ERROR: bad use value: %u in element %d\n", ht_outer[i].use, i);
-        }
-        spin_unlock_bh(&ht_outer[i].lock);
     }
 
     kvfree(ht_inner);
@@ -439,18 +410,28 @@ static int nat_htable_create(void)
     return 0;
 }
 
-static struct nat_htable_ent *lookup_session(struct xt_nat_htable *ht, const uint8_t proto, const u_int32_t addr, const uint16_t port)
+static struct nat_session *lookup_session_in(const uint8_t proto, const u_int32_t addr, const uint16_t port)
 {
-    struct nat_htable_ent *session;
-    struct hlist_head *head;
+    struct nat_session *s;
     unsigned int hash;
 
     hash = get_hash_nat_ent(proto, addr, port);
-    head = &ht[hash].session;
-    hlist_for_each_entry_rcu(session, head, list_node) {
-        if (session->addr == addr && session->port == port && session->proto == proto && session->data->timeout > 0) {
-            return session;
-        }
+    hlist_for_each_entry_rcu(s, &ht_inner[hash].session, inner_node) {
+        if (s->in_addr == addr && s->in_port == port && s->proto == proto && s->timeout > 0)
+            return s;
+    }
+    return NULL;
+}
+
+static struct nat_session *lookup_session_out(const uint8_t proto, const u_int32_t addr, const uint16_t port)
+{
+    struct nat_session *s;
+    unsigned int hash;
+
+    hash = get_hash_nat_ent(proto, addr, port);
+    hlist_for_each_entry_rcu(s, &ht_outer[hash].session, outer_node) {
+        if (s->nat_addr == addr && s->out_port == port && s->proto == proto && s->timeout > 0)
+            return s;
     }
     return NULL;
 }
@@ -465,7 +446,7 @@ static uint16_t search_free_l4_port(const uint8_t proto, const u_int32_t nataddr
             freeport += 1024;
         }
 
-        if(!lookup_session(ht_outer, proto, nataddr, htons(freeport))) {
+        if(!lookup_session_out(proto, nataddr, htons(freeport))) {
             return htons(freeport);
         }
     }
@@ -704,13 +685,11 @@ static void netflow_export_flow_v9(const uint8_t proto, const u_int32_t srcaddr,
     spin_unlock_bh(&nfsend_lock);
 }
 
-static struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_int32_t useraddr, const uint16_t userport, const u_int32_t dstaddr, const uint16_t dstport, const u_int32_t nataddr)
+static struct nat_session *create_nat_session(const uint8_t proto, const u_int32_t useraddr, const uint16_t userport, const u_int32_t dstaddr, const uint16_t dstport, const u_int32_t nataddr)
 {
-    unsigned int hash;
-    struct nat_htable_ent *session, *session2, *existing;
-    struct nat_session *data_session;
+    struct nat_session *sess, *existing;
     uint16_t natport;
-    unsigned int nataddr_id;
+    unsigned int nataddr_id, hash;
 
     atomic64_inc(&sessions_tried);
 
@@ -720,27 +699,13 @@ static struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_in
         return NULL;
     }
 
-    /* Allocate before taking the lock. These three allocations used to sit
-     * inside the per-NAT-address critical section, which every subscriber
-     * sharing that address serialises on; GFP_ATOMIC can still have to walk
-     * the freelists. Nothing here needs the lock, and on the rare paths that
-     * bail out the objects are simply freed - they were never published.
-     */
-    data_session = kmem_cache_zalloc(nat_session_cache, GFP_ATOMIC);
-    if (unlikely(data_session == NULL))
-        goto err_nomem;
-
-    session = kmem_cache_zalloc(nat_htent_cache, GFP_ATOMIC);
-    if (unlikely(session == NULL)) {
-        kmem_cache_free(nat_session_cache, data_session);
-        goto err_nomem;
-    }
-
-    session2 = kmem_cache_zalloc(nat_htent_cache, GFP_ATOMIC);
-    if (unlikely(session2 == NULL)) {
-        kmem_cache_free(nat_htent_cache, session);
-        kmem_cache_free(nat_session_cache, data_session);
-        goto err_nomem;
+    /* allocated before the lock: nothing here needs it, and on the paths that
+     * bail out the object is simply freed - it was never published */
+    sess = kmem_cache_zalloc(nat_session_cache, GFP_ATOMIC);
+    if (unlikely(sess == NULL)) {
+        atomic64_inc(&ses_fail_nomem);
+        printk_ratelimited(KERN_WARNING "xt_NAT create_nat_session ERROR: Cannot allocate session\n");
+        return NULL;
     }
 
     nataddr_id = ntohl(nataddr) - ntohl(nat_pool_start);
@@ -750,13 +715,10 @@ static struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_in
      * session with rcu_read_lock_bh() held for it to drop.
      */
     rcu_read_lock_bh();
-    existing = lookup_session(ht_inner, proto, useraddr, userport);
+    existing = lookup_session_in(proto, useraddr, userport);
     if (unlikely(existing)) {
         spin_unlock_bh(&create_session_lock[nataddr_id]);
-        nat_session_discard(data_session, session, session2);
-        existing = lookup_session(ht_outer, proto, nataddr, existing->data->out_port);
-        if (unlikely(existing == NULL))
-            rcu_read_unlock_bh();
+        kmem_cache_free(nat_session_cache, sess);
         atomic64_inc(&sessions_dup);
         return existing;
     }
@@ -770,65 +732,46 @@ static struct nat_htable_ent *create_nat_session(const uint8_t proto, const u_in
             atomic64_inc(&ses_fail_noport);
             printk_ratelimited(KERN_WARNING "xt_NAT create_nat_session ERROR: Not found free nat port for %d %pI4:%u -> %pI4:XXXX\n", proto, &useraddr, userport, &nataddr);
             spin_unlock_bh(&create_session_lock[nataddr_id]);
-            nat_session_discard(data_session, session, session2);
+            kmem_cache_free(nat_session_cache, sess);
             return NULL;
         }
     } else {
         natport = userport;
     }
 
-    /* one reference for the ht_inner entry, one for the ht_outer entry */
-    refcount_set(&data_session->refcnt, 2);
-
-    data_session->in_addr = useraddr;
-    data_session->in_port = userport;
-    data_session->out_port = natport;
-    data_session->dst_addr = dstaddr;
-    data_session->dst_port = dstport;
-    data_session->timeout = 30;
-    data_session->flags = 0;
-
-    session->proto = proto;
-    session->addr = useraddr;
-    session->port = userport;
-    session->data = data_session;
-
-    session2->proto = proto;
-    session2->addr = nataddr;
-    session2->port = natport;
-    session2->data = data_session;
+    sess->in_addr    = useraddr;
+    sess->in_port    = userport;
+    sess->nat_addr   = nataddr;
+    sess->out_port   = natport;
+    sess->u.dst.addr = dstaddr;
+    sess->u.dst.port = dstport;
+    sess->timeout    = 30;
+    sess->proto      = proto;
+    sess->flags      = 0;
 
     hash = get_hash_nat_ent(proto, useraddr, userport);
     spin_lock_bh(&ht_inner[hash].lock);
-    hlist_add_head_rcu(&session->list_node, &ht_inner[hash].session);
+    hlist_add_head_rcu(&sess->inner_node, &ht_inner[hash].session);
     ht_inner[hash].use++;
     spin_unlock_bh(&ht_inner[hash].lock);
 
     hash = get_hash_nat_ent(proto, nataddr, natport);
     spin_lock_bh(&ht_outer[hash].lock);
-    hlist_add_head_rcu(&session2->list_node, &ht_outer[hash].session);
+    hlist_add_head_rcu(&sess->outer_node, &ht_outer[hash].session);
     ht_outer[hash].use++;
     spin_unlock_bh(&ht_outer[hash].lock);
 
     spin_unlock_bh(&create_session_lock[nataddr_id]);
 
     update_user_limits(proto, useraddr, 1);
-
     netflow_export_flow_v9(proto, useraddr, userport, dstaddr, dstport, nataddr, natport, 1);
 
     atomic64_inc(&sessions_created);
     atomic64_inc(&sessions_active);
 
-    /* session2 is the entry just published into ht_outer under exactly these
-     * keys; re-looking it up walked the hash to find what we already hold.
-     */
+    /* published above; the caller drops this read lock */
     rcu_read_lock_bh();
-    return session2;
-
-err_nomem:
-    atomic64_inc(&ses_fail_nomem);
-    printk_ratelimited(KERN_WARNING "xt_NAT create_nat_session ERROR: Cannot allocate session\n");
-    return NULL;
+    return sess;
 }
 
 static unsigned int
@@ -838,7 +781,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
     struct tcphdr *tcp;
     struct udphdr *udp;
     struct icmphdr *icmp;
-    struct nat_htable_ent *session;
+    struct nat_session *session;
     uint32_t nat_addr;
     uint16_t nat_port;
     unsigned int inner_hlen;
@@ -883,25 +826,25 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             skb_reset_transport_header(skb);
 
             rcu_read_lock_bh();
-            session = lookup_session(ht_inner, ip->protocol, ip->saddr, tcp->source);
+            session = lookup_session_in(ip->protocol, ip->saddr, tcp->source);
             if (session) {
                 csum_replace4(&ip->check, ip->saddr, nat_addr);
                 inet_proto_csum_replace4(&tcp->check, skb, ip->saddr, nat_addr, true);
-                inet_proto_csum_replace2(&tcp->check, skb, tcp->source, session->data->out_port, true);
+                inet_proto_csum_replace2(&tcp->check, skb, tcp->source, session->out_port, true);
 
                 ip->saddr = nat_addr;
-                tcp->source = session->data->out_port;
+                tcp->source = session->out_port;
 
                 if (tcp->fin || tcp->rst) {
-                    session->data->timeout=10;
-                    session->data->flags |= FLAG_TCP_FIN;
-                } else if (session->data->flags & FLAG_TCP_FIN) {
-                    session->data->timeout=10;
-                    session->data->flags &= ~FLAG_TCP_FIN;
-                } else if ((session->data->flags & FLAG_REPLIED) == 0) {
-                    session->data->timeout=30;
+                    session->timeout=10;
+                    session->flags |= FLAG_TCP_FIN;
+                } else if (session->flags & FLAG_TCP_FIN) {
+                    session->timeout=10;
+                    session->flags &= ~FLAG_TCP_FIN;
+                } else if ((session->flags & FLAG_REPLIED) == 0) {
+                    session->timeout=30;
                 } else {
-                    session->data->timeout=300;
+                    session->timeout=300;
                 }
 
                 rcu_read_unlock_bh();
@@ -913,11 +856,11 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                     return NF_DROP;
                 }
 
-                csum_replace4(&ip->check, ip->saddr, session->addr);
-                inet_proto_csum_replace4(&tcp->check, skb, ip->saddr, session->addr, true);
-                inet_proto_csum_replace2(&tcp->check, skb, session->data->in_port, session->data->out_port, true);
-                ip->saddr = session->addr;
-                tcp->source = session->data->out_port;
+                csum_replace4(&ip->check, ip->saddr, session->nat_addr);
+                inet_proto_csum_replace4(&tcp->check, skb, ip->saddr, session->nat_addr, true);
+                inet_proto_csum_replace2(&tcp->check, skb, session->in_port, session->out_port, true);
+                ip->saddr = session->nat_addr;
+                tcp->source = session->out_port;
                 rcu_read_unlock_bh();
             }
 
@@ -937,19 +880,19 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             skb_reset_transport_header(skb);
 
             rcu_read_lock_bh();
-            session = lookup_session(ht_inner, ip->protocol, ip->saddr, udp->source);
+            session = lookup_session_in(ip->protocol, ip->saddr, udp->source);
             if (session) {
                 csum_replace4(&ip->check, ip->saddr, nat_addr);
                 if (udp->check) {
                     inet_proto_csum_replace4(&udp->check, skb, ip->saddr, nat_addr, true);
-                    inet_proto_csum_replace2(&udp->check, skb, udp->source, session->data->out_port, true);
+                    inet_proto_csum_replace2(&udp->check, skb, udp->source, session->out_port, true);
                 }
                 ip->saddr = nat_addr;
-                udp->source = session->data->out_port;
-                if ((session->data->flags & FLAG_REPLIED) == 0) {
-                    session->data->timeout=30;
+                udp->source = session->out_port;
+                if ((session->flags & FLAG_REPLIED) == 0) {
+                    session->timeout=30;
                 } else {
-                    session->data->timeout=300;
+                    session->timeout=300;
                 }
                 rcu_read_unlock_bh();
             } else {
@@ -959,13 +902,13 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                     atomic64_inc(&pkt_drop_nosession);
                     return NF_DROP;
                 }
-                csum_replace4(&ip->check, ip->saddr, session->addr);
+                csum_replace4(&ip->check, ip->saddr, session->nat_addr);
                 if (udp->check) {
-                    inet_proto_csum_replace4(&udp->check, skb, ip->saddr, session->addr, true);
-                    inet_proto_csum_replace2(&udp->check, skb, session->data->in_port, session->data->out_port, true);
+                    inet_proto_csum_replace4(&udp->check, skb, ip->saddr, session->nat_addr, true);
+                    inet_proto_csum_replace2(&udp->check, skb, session->in_port, session->out_port, true);
                 }
-                ip->saddr = session->addr;
-                udp->source = session->data->out_port;
+                ip->saddr = session->nat_addr;
+                udp->source = session->out_port;
                 rcu_read_unlock_bh();
             }
         } else if (ip->protocol == IPPROTO_ICMP) {
@@ -989,16 +932,16 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             }
 
             rcu_read_lock_bh();
-            session = lookup_session(ht_inner, ip->protocol, ip->saddr, nat_port);
+            session = lookup_session_in(ip->protocol, ip->saddr, nat_port);
             if (session) {
                 csum_replace4(&ip->check, ip->saddr, nat_addr);
                 ip->saddr = nat_addr;
 
                 if (icmp->type == 0 || icmp->type == 8) {
-                    inet_proto_csum_replace2(&icmp->checksum, skb, nat_port, session->data->out_port, true);
-                    icmp->un.echo.id = session->data->out_port;
+                    inet_proto_csum_replace2(&icmp->checksum, skb, nat_port, session->out_port, true);
+                    icmp->un.echo.id = session->out_port;
                 }
-                session->data->timeout=30;
+                session->timeout=30;
                 rcu_read_unlock_bh();
             } else {
                 rcu_read_unlock_bh();
@@ -1007,11 +950,11 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                     atomic64_inc(&pkt_drop_nosession);
                     return NF_DROP;
                 }
-                csum_replace4(&ip->check, ip->saddr, session->addr);
-                ip->saddr = session->addr;
+                csum_replace4(&ip->check, ip->saddr, session->nat_addr);
+                ip->saddr = session->nat_addr;
                 if (icmp->type == 0 || icmp->type == 8) {
-                    inet_proto_csum_replace2(&icmp->checksum, skb, nat_port, session->data->out_port, true);
-                    icmp->un.echo.id = session->data->out_port;
+                    inet_proto_csum_replace2(&icmp->checksum, skb, nat_port, session->out_port, true);
+                    icmp->un.echo.id = session->out_port;
                 }
                 rcu_read_unlock_bh();
             }
@@ -1023,14 +966,14 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             ip = (struct iphdr *)skb_network_header(skb);
 
             rcu_read_lock_bh();
-            session = lookup_session(ht_inner, ip->protocol, ip->saddr, 0);
+            session = lookup_session_in(ip->protocol, ip->saddr, 0);
             if (session) {
                 csum_replace4(&ip->check, ip->saddr, nat_addr);
                 ip->saddr = nat_addr;
-                if ((session->data->flags & FLAG_REPLIED) == 0) {
-                    session->data->timeout=30;
+                if ((session->flags & FLAG_REPLIED) == 0) {
+                    session->timeout=30;
                 } else {
-                    session->data->timeout=300;
+                    session->timeout=300;
                 }
                 rcu_read_unlock_bh();
             } else {
@@ -1040,8 +983,8 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                     atomic64_inc(&pkt_drop_nosession);
                     return NF_DROP;
                 }
-                csum_replace4(&ip->check, ip->saddr, session->addr);
-                ip->saddr = session->addr;
+                csum_replace4(&ip->check, ip->saddr, session->nat_addr);
+                ip->saddr = session->nat_addr;
                 rcu_read_unlock_bh();
             }
         }
@@ -1063,23 +1006,23 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             skb_reset_transport_header(skb);
 
             rcu_read_lock_bh();
-            session = lookup_session(ht_outer, ip->protocol, ip->daddr, tcp->dest);
+            session = lookup_session_out(ip->protocol, ip->daddr, tcp->dest);
             if (likely(session)) {
 		skb_reset_transport_header(skb);
-                csum_replace4(&ip->check, ip->daddr, session->data->in_addr);
-                inet_proto_csum_replace4(&tcp->check, skb, ip->daddr, session->data->in_addr, true);
-                inet_proto_csum_replace2(&tcp->check, skb, tcp->dest, session->data->in_port, true);
-                ip->daddr = session->data->in_addr;
-                tcp->dest = session->data->in_port;
+                csum_replace4(&ip->check, ip->daddr, session->in_addr);
+                inet_proto_csum_replace4(&tcp->check, skb, ip->daddr, session->in_addr, true);
+                inet_proto_csum_replace2(&tcp->check, skb, tcp->dest, session->in_port, true);
+                ip->daddr = session->in_addr;
+                tcp->dest = session->in_port;
                 if (tcp->fin || tcp->rst) {
-                    session->data->timeout=10;
-                    session->data->flags |= FLAG_TCP_FIN;
-                } else if (session->data->flags & FLAG_TCP_FIN) {
-                    session->data->timeout=10;
-                    session->data->flags &= ~FLAG_TCP_FIN;
-                } else if ((session->data->flags & FLAG_REPLIED) == 0) {
-                    session->data->timeout=300;
-                    session->data->flags |= FLAG_REPLIED;
+                    session->timeout=10;
+                    session->flags |= FLAG_TCP_FIN;
+                } else if (session->flags & FLAG_TCP_FIN) {
+                    session->timeout=10;
+                    session->flags &= ~FLAG_TCP_FIN;
+                } else if ((session->flags & FLAG_REPLIED) == 0) {
+                    session->timeout=300;
+                    session->flags |= FLAG_REPLIED;
                 }
                 rcu_read_unlock_bh();
             } else {
@@ -1103,20 +1046,20 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             udp = (struct udphdr *)skb_transport_header(skb);
 
             rcu_read_lock_bh();
-            session = lookup_session(ht_outer, ip->protocol, ip->daddr, udp->dest);
+            session = lookup_session_out(ip->protocol, ip->daddr, udp->dest);
             if (likely(session)) {
 		skb_reset_transport_header(skb);
-                csum_replace4(&ip->check, ip->daddr, session->data->in_addr);
+                csum_replace4(&ip->check, ip->daddr, session->in_addr);
                 if (udp->check) {
-                    inet_proto_csum_replace4(&udp->check, skb, ip->daddr, session->data->in_addr, true);
-                    inet_proto_csum_replace2(&udp->check, skb, udp->dest, session->data->in_port, true);
+                    inet_proto_csum_replace4(&udp->check, skb, ip->daddr, session->in_addr, true);
+                    inet_proto_csum_replace2(&udp->check, skb, udp->dest, session->in_port, true);
                 }
-                ip->daddr = session->data->in_addr;
-                udp->dest = session->data->in_port;
+                ip->daddr = session->in_addr;
+                udp->dest = session->in_port;
 
-                if ((session->data->flags & FLAG_REPLIED) == 0) {
-                    session->data->timeout=300;
-                    session->data->flags |= FLAG_REPLIED;
+                if ((session->flags & FLAG_REPLIED) == 0) {
+                    session->timeout=300;
+                    session->flags |= FLAG_REPLIED;
                 }
                 rcu_read_unlock_bh();
             } else {
@@ -1190,38 +1133,38 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                     tcp = (struct tcphdr *)skb_transport_header(skb);
                     skb_reset_transport_header(skb);
                     rcu_read_lock_bh();
-                    session = lookup_session(ht_outer, ip->protocol, ip->saddr, tcp->source);
+                    session = lookup_session_out(ip->protocol, ip->saddr, tcp->source);
                     if (session) {
-                        csum_replace4(&ip->check, ip->saddr, session->data->in_addr);
-                        ip->saddr = session->data->in_addr;
-                        tcp->source = session->data->in_port;
+                        csum_replace4(&ip->check, ip->saddr, session->in_addr);
+                        ip->saddr = session->in_addr;
+                        tcp->source = session->in_port;
                     } else {
                         rcu_read_unlock_bh();
                         return NF_ACCEPT;
                     }
 
                     ip = (struct iphdr *)skb_network_header(skb);
-                    csum_replace4(&ip->check, ip->daddr, session->data->in_addr);
-                    ip->daddr = session->data->in_addr;
+                    csum_replace4(&ip->check, ip->daddr, session->in_addr);
+                    ip->daddr = session->in_addr;
                     rcu_read_unlock_bh();
                 } else if (ip->protocol == IPPROTO_UDP) {
                     skb_set_transport_header(skb, sizeof(struct iphdr) + sizeof(struct icmphdr) + inner_hlen);
                     udp = (struct udphdr *)skb_transport_header(skb);
                     skb_reset_transport_header(skb);
                     rcu_read_lock_bh();
-                    session = lookup_session(ht_outer, ip->protocol, ip->saddr, udp->source);
+                    session = lookup_session_out(ip->protocol, ip->saddr, udp->source);
                     if (session) {
-                        csum_replace4(&ip->check, ip->saddr, session->data->in_addr);
-                        ip->saddr = session->data->in_addr;
-                        udp->source = session->data->in_port;
+                        csum_replace4(&ip->check, ip->saddr, session->in_addr);
+                        ip->saddr = session->in_addr;
+                        udp->source = session->in_port;
                     } else {
                         rcu_read_unlock_bh();
                         return NF_ACCEPT;
                     }
                     ip = (struct iphdr *)skb_network_header(skb);
 
-                    csum_replace4(&ip->check, ip->daddr, session->data->in_addr);
-                    ip->daddr = session->data->in_addr;
+                    csum_replace4(&ip->check, ip->daddr, session->in_addr);
+                    ip->daddr = session->in_addr;
                     rcu_read_unlock_bh();
                 } else if (ip->protocol == IPPROTO_ICMP) {
                     skb_set_transport_header(skb, sizeof(struct iphdr) + sizeof(struct icmphdr) + inner_hlen);
@@ -1234,14 +1177,14 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                     }
 
                     rcu_read_lock_bh();
-                    session = lookup_session(ht_outer, ip->protocol, ip->saddr, nat_port);
+                    session = lookup_session_out(ip->protocol, ip->saddr, nat_port);
                     if (session) {
-                        csum_replace4(&ip->check, ip->saddr, session->data->in_addr);
-                        ip->saddr = session->data->in_addr;
+                        csum_replace4(&ip->check, ip->saddr, session->in_addr);
+                        ip->saddr = session->in_addr;
 
                         if (icmp->type == 0 || icmp->type == 8) {
-                            inet_proto_csum_replace2(&icmp->checksum, skb, nat_port, session->data->in_port, true);
-                            icmp->un.echo.id = session->data->in_port;
+                            inet_proto_csum_replace2(&icmp->checksum, skb, nat_port, session->in_port, true);
+                            icmp->un.echo.id = session->in_port;
                         }
 
                     } else {
@@ -1249,8 +1192,8 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                         return NF_ACCEPT;
                     }
                     ip = (struct iphdr *)skb_network_header(skb);
-                    csum_replace4(&ip->check, ip->daddr, session->data->in_addr);
-                    ip->daddr = session->data->in_addr;
+                    csum_replace4(&ip->check, ip->daddr, session->in_addr);
+                    ip->daddr = session->in_addr;
                     rcu_read_unlock_bh();
                 }
 
@@ -1271,17 +1214,17 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 return NF_ACCEPT;
             }
             rcu_read_lock_bh();
-            session = lookup_session(ht_outer, ip->protocol, ip->daddr, nat_port);
+            session = lookup_session_out(ip->protocol, ip->daddr, nat_port);
             if (likely(session)) {
-                csum_replace4(&ip->check, ip->daddr, session->data->in_addr);
-                ip->daddr = session->data->in_addr;
+                csum_replace4(&ip->check, ip->daddr, session->in_addr);
+                ip->daddr = session->in_addr;
                 if (icmp->type == 0 || icmp->type == 8) {
-                    inet_proto_csum_replace2(&icmp->checksum, skb, nat_port, session->data->in_port, true);
-                    icmp->un.echo.id = session->data->in_port;
+                    inet_proto_csum_replace2(&icmp->checksum, skb, nat_port, session->in_port, true);
+                    icmp->un.echo.id = session->in_port;
                 }
-                if ((session->data->flags & FLAG_REPLIED) == 0) {
-                    session->data->timeout=30;
-                    session->data->flags |= FLAG_REPLIED;
+                if ((session->flags & FLAG_REPLIED) == 0) {
+                    session->timeout=30;
+                    session->flags |= FLAG_REPLIED;
                 }
                 rcu_read_unlock_bh();
             } else {
@@ -1297,13 +1240,13 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 
             nat_port = 0;
             rcu_read_lock_bh();
-            session = lookup_session(ht_outer, ip->protocol, ip->daddr, nat_port);
+            session = lookup_session_out(ip->protocol, ip->daddr, nat_port);
             if (likely(session)) {
-                csum_replace4(&ip->check, ip->daddr, session->data->in_addr);
-                ip->daddr = session->data->in_addr;
-                if ((session->data->flags & FLAG_REPLIED) == 0) {
-                    session->data->timeout=300;
-                    session->data->flags |= FLAG_REPLIED;
+                csum_replace4(&ip->check, ip->daddr, session->in_addr);
+                ip->daddr = session->in_addr;
+                if ((session->flags & FLAG_REPLIED) == 0) {
+                    session->timeout=300;
+                    session->flags |= FLAG_REPLIED;
                 }
                 rcu_read_unlock_bh();
             } else {
@@ -1365,11 +1308,9 @@ static void users_cleanup_timer_callback( struct timer_list *timer )
 
 static void sessions_cleanup_timer_callback( struct timer_list *timer )
 {
-    struct nat_htable_ent *session;
-    struct hlist_head *head;
+    struct nat_session *sess;
     struct hlist_node *next;
-    struct nat_session *data;
-    unsigned int i;
+    unsigned int i, ohash;
     uint8_t proto;
     u_int32_t addr;
     u_int32_t vector_start, vector_end;
@@ -1391,47 +1332,42 @@ static void sessions_cleanup_timer_callback( struct timer_list *timer )
         nat_htable_vector++;
     }
 
+    /* One pass over ht_inner. The session is a single object in both chains,
+     * so it is unlinked from both here and freed once. The outer table no
+     * longer needs a sweep of its own - and the two unlinks can no longer be
+     * separated by a sweep cycle, which is what used to let a session be freed
+     * while it was still reachable through the other table.
+     */
     for (i = vector_start; i < vector_end; i++) {
         spin_lock_bh(&ht_inner[i].lock);
         if (ht_inner[i].use > 0) {
-            head = &ht_inner[i].session;
-            hlist_for_each_entry_safe(session, next, head, list_node) {
-                session->data->timeout -= 10;
-                if (session->data->timeout == 0) {
-                    netflow_export_flow_v9(session->proto, session->addr, session->port, session->data->dst_addr, session->data->dst_port, get_nat_addr(session->addr), session->data->out_port, 2);
-                } else if (session->data->timeout <= -10) {
-                    /* save what we need: after kfree_rcu() the entry is dead */
-                    data  = session->data;
-                    proto = session->proto;
-                    addr  = session->addr;
+            hlist_for_each_entry_safe(sess, next, &ht_inner[i].session, inner_node) {
+                sess->timeout -= 10;
+                if (sess->timeout == 0) {
+                    /* last read of u.dst: the union becomes an rcu_head below */
+                    netflow_export_flow_v9(sess->proto, sess->in_addr, sess->in_port,
+                                           sess->u.dst.addr, sess->u.dst.port,
+                                           sess->nat_addr, sess->out_port, 2);
+                } else if (sess->timeout <= -10) {
+                    proto = sess->proto;
+                    addr  = sess->in_addr;
 
-                    hlist_del_rcu(&session->list_node);
+                    ohash = get_hash_nat_ent(proto, sess->nat_addr, sess->out_port);
+                    spin_lock_bh(&ht_outer[ohash].lock);
+                    hlist_del_rcu(&sess->outer_node);
+                    ht_outer[ohash].use--;
+                    spin_unlock_bh(&ht_outer[ohash].lock);
+
+                    hlist_del_rcu(&sess->inner_node);
                     ht_inner[i].use--;
-                    call_rcu(&session->rcu, nat_htent_free_rcu);
-                    nat_session_put(data);
+
+                    call_rcu(&sess->u.rcu, nat_session_free_rcu);
+                    atomic64_dec(&sessions_active);
                     update_user_limits(proto, addr, -1);
                 }
             }
         }
         spin_unlock_bh(&ht_inner[i].lock);
-    }
-
-    for (i = vector_start; i < vector_end; i++) {
-        spin_lock_bh(&ht_outer[i].lock);
-        if (ht_outer[i].use > 0) {
-            head = &ht_outer[i].session;
-            hlist_for_each_entry_safe(session, next, head, list_node) {
-                if (session->data->timeout <= -10) {
-                    data = session->data;
-                    hlist_del_rcu(&session->list_node);
-                    ht_outer[i].use--;
-                    call_rcu(&session->rcu, nat_htent_free_rcu);
-                    nat_session_put(data);
-                    atomic64_dec(&sessions_active);
-                }
-            }
-        }
-        spin_unlock_bh(&ht_outer[i].lock);
     }
 
     if (likely(atomic_read(&timers_state) == NAT_TIMERS_RUN))
@@ -1481,7 +1417,7 @@ static void nat_timers_stop(void)
 
 static int nat_seq_show(struct seq_file *m, void *v)
 {
-    struct nat_htable_ent *session;
+    struct nat_session *session;
     struct hlist_head *head;
     unsigned int i, count;
 
@@ -1492,18 +1428,18 @@ static int nat_seq_show(struct seq_file *m, void *v)
         rcu_read_lock_bh();
         if (ht_outer[i].use > 0) {
             head = &ht_outer[i].session;
-            hlist_for_each_entry_rcu(session, head, list_node) {
-                if (session->data->timeout > 0) {
+            hlist_for_each_entry_rcu(session, head, outer_node) {
+                if (session->timeout > 0) {
                     seq_printf(m, "%d %pI4:%u -> %pI4:%u --- ttl: %d\n",
                                session->proto,
-                               &session->data->in_addr, ntohs(session->data->in_port),
-                               &session->addr, ntohs(session->port),
-                               session->data->timeout);
+                               &session->in_addr, ntohs(session->in_port),
+                               &session->nat_addr, ntohs(session->out_port),
+                               session->timeout);
                 } else {
                     seq_printf(m, "%d %pI4:%u -> %pI4:%u --- (will be removed due timeout)\n",
                                session->proto,
-                               &session->data->in_addr, ntohs(session->data->in_port),
-                               &session->addr, ntohs(session->port));
+                               &session->in_addr, ntohs(session->in_port),
+                               &session->nat_addr, ntohs(session->out_port));
                 }
                 count++;
             }
@@ -1773,19 +1709,16 @@ static int __init nat_tg_init(void)
     printk(KERN_INFO "xt_NAT DEBUG: NAT hash size: %d\n", nat_hash_size);
     printk(KERN_INFO "xt_NAT DEBUG: Users hash size: %d\n", users_hash_size);
 
-    /* No SLAB_HWCACHE_ALIGN: it rounds the 40 byte session and the 56 byte
-     * hash entry both up to 64, which is exactly what kmalloc-64 already did -
-     * all of the padding, none of the benefit. At natural alignment the three
-     * objects a session needs are 152 bytes rather than 192, 21% less, and
-     * more of them fit in a page so the cache grows in fewer page allocations.
+    /* The layout is load bearing: at exactly 64 bytes the object is one
+     * cacheline and SLAB_HWCACHE_ALIGN adds no padding. Adding a field would
+     * silently double the cost of every lookup, so say so at build time.
      */
+    BUILD_BUG_ON(sizeof(struct nat_session) != 64);
+
     nat_session_cache = kmem_cache_create("xt_NAT_session",
                                           sizeof(struct nat_session), 0,
-                                          0, NULL);
-    nat_htent_cache = kmem_cache_create("xt_NAT_htent",
-                                        sizeof(struct nat_htable_ent), 0,
-                                        0, NULL);
-    if (!nat_session_cache || !nat_htent_cache) {
+                                          SLAB_HWCACHE_ALIGN, NULL);
+    if (!nat_session_cache) {
         ret = -ENOMEM;
         goto err_caches;
     }
@@ -1836,9 +1769,7 @@ err_tables:
 err_caches:
     /* nothing has been published yet, so no RCU callbacks can be outstanding */
     kmem_cache_destroy(nat_session_cache);
-    kmem_cache_destroy(nat_htent_cache);
     nat_session_cache = NULL;
-    nat_htent_cache = NULL;
     printk(KERN_ERR "xt_NAT ERROR: module load failed, error %d\n", ret);
     return ret;
 }
@@ -1861,9 +1792,7 @@ static void __exit nat_tg_exit(void)
      * before the caches they free into can be destroyed */
     rcu_barrier();
     kmem_cache_destroy(nat_session_cache);
-    kmem_cache_destroy(nat_htent_cache);
     nat_session_cache = NULL;
-    nat_htent_cache = NULL;
 
     printk(KERN_INFO "Module xt_NAT unloaded\n");
 }
