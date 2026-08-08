@@ -1,4 +1,4 @@
-# github workflow to test xt_CGNAT_with_netflow_v9 on various vanilla kernels
+# github workflow: build xt_CGNAT against a spread of vanilla kernels
 name: Kernels Build and Test
 on:
 # manually triggered workflow
@@ -13,26 +13,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        kernel-version: [6.18, 6.12.58, 6.6.116, 6.1.158, 5.15.196, 5.10.246]
+        kernel-version: [7.0, 6.19, 6.18, 6.12.58, 6.6.116, 6.1.158, 5.15.196, 5.10.246]
     name: Test with ${{ matrix.kernel-version }}    
     steps:
         - name: Checkout repository
           uses: actions/checkout@v2
           with:
             fetch-depth: 0  # Fetch all history for all branches and tags
-            path: xt_CGNAT_with_netflow_v9
+            path: xt_CGNAT
         - name: Install dependencies
           run: |
             sudo apt-get update
             sudo apt-get install -y flex bison libelf-dev bc libxtables-dev pkg-config dkms libxtables-dev pkg-config
         - name: Download kernel
           run: |
-            # if kernel is 6. we use v6.x, otherwise we use v5.x
-            if [[ "${{ matrix.kernel-version }}" == 6.* ]]; then
-              KERNEL_URL="https://cdn.kernel.org/pub/linux/kernel/v6.x";
-            else
-              KERNEL_URL="https://cdn.kernel.org/pub/linux/kernel/v5.x";
-            fi
+            # cdn.kernel.org groups by major: v5.x, v6.x, v7.x
+            MAJOR="${{ matrix.kernel-version }}"
+            KERNEL_URL="https://cdn.kernel.org/pub/linux/kernel/v${MAJOR%%.*}.x"
             echo "Downloading kernel from $KERNEL_URL"
             wget $KERNEL_URL/linux-${{ matrix.kernel-version }}.tar.xz
         - name: Extract kernel source
@@ -60,9 +57,9 @@ jobs:
             make olddefconfig
             make -j$(nproc)
             cd ..
-        - name: Build xt_CGNAT_with_netflow_v9
+        - name: Build xt_CGNAT
           run: |
             ls -la
-            cd xt_CGNAT_with_netflow_v9
+            cd xt_CGNAT
             make KDIR=../linux-${{ matrix.kernel-version }}
 
