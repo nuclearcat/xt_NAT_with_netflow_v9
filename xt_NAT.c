@@ -13,6 +13,7 @@
 #include <linux/inet.h>
 #include <linux/proc_fs.h>
 #include <linux/percpu.h>
+#include <linux/bitmap.h>
 #include <linux/mm.h>
 #include <net/tcp.h>
 #include "compat.h"
@@ -126,7 +127,56 @@ MODULE_PARM_DESC(nf_dest, "Netflow v9 collectors (addr1:port1[,addr2:port2]), de
 u_int32_t nat_htable_vector = 0;
 u_int32_t users_htable_vector = 0;
 
+/* the pool bounds are needed by the port bitmap helpers below */
+static u_int32_t nat_pool_start;
+static u_int32_t nat_pool_end;
+
 static spinlock_t *create_session_lock;
+
+/* One bit per port per (NAT address, protocol). The outer hash is keyed on
+ * (proto, nat addr, out port), so TCP 5000 and UDP 5000 are distinct mappings
+ * and each protocol needs its own port space; sharing one bitmap per address
+ * would quietly cut capacity to a third.
+ *
+ * Bits below 1024 are never set - allocation starts there - so the low 128
+ * bytes of each map are wasted in exchange for the port number being the bit
+ * index directly.
+ *
+ * A bit is set when a port is handed out and cleared when the session's
+ * timeout reaches 0, which is the instant it stops being visible to
+ * lookup_session_out(). That is deliberately the same moment the old linear
+ * scan would have considered the port free again, so this changes speed and
+ * nothing else. Moving the clear_bit() to the unlink instead would add a real
+ * port quarantine - see the note in the cleanup timer.
+ */
+#define NAT_PORT_BITS    65536
+#define NAT_PORT_LO      1024
+#define NAT_PROTO_SLOTS  3              /* TCP, UDP, ICMP */
+#define NAT_PORT_LONGS   BITS_TO_LONGS(NAT_PORT_BITS)
+static unsigned long *nat_port_bitmap;
+
+static inline int nat_port_slot(uint8_t proto)
+{
+    switch (proto) {
+    case IPPROTO_TCP:  return 0;
+    case IPPROTO_UDP:  return 1;
+    case IPPROTO_ICMP: return 2;
+    }
+    return -1;                          /* other protocols do not allocate */
+}
+
+static inline unsigned long *nat_ports_for(const u_int32_t nataddr, uint8_t proto)
+{
+    unsigned int id;
+    int slot;
+
+    slot = nat_port_slot(proto);
+    if (unlikely(slot < 0 || nat_port_bitmap == NULL))
+        return NULL;
+
+    id = ntohl(nataddr) - ntohl(nat_pool_start);
+    return nat_port_bitmap + ((size_t)id * NAT_PROTO_SLOTS + slot) * NAT_PORT_LONGS;
+}
 
 static DEFINE_SPINLOCK(sessions_timer_lock);
 static DEFINE_SPINLOCK(users_timer_lock);
@@ -222,8 +272,6 @@ struct user_htable_ent {
 
 struct xt_users_htable *ht_users;
 
-static u_int32_t nat_pool_start;
-static u_int32_t nat_pool_end;
 
 struct xt_nat_htable *ht_inner, *ht_outer;
 
@@ -274,7 +322,7 @@ get_hash_user_ent(const u_int32_t addr)
 
 static int pool_table_create(void)
 {
-    size_t sz; /* (bytes) */
+    size_t sz, bsz; /* (bytes) */
     unsigned int pool_size;
     int i;
 
@@ -292,6 +340,21 @@ static int pool_table_create(void)
 
     printk(KERN_INFO "xt_NAT DEBUG: nat pool table mem: %zu\n", sz);
 
+    /* 8KB per protocol per NAT address: 24KB an address, 6MB for a /24, 100MB
+     * for a /20. A pool large enough for that to hurt could not hold the
+     * sessions to fill it anyway - a /20 is 264 million ports.
+     */
+    bsz = (size_t)pool_size * NAT_PROTO_SLOTS * NAT_PORT_LONGS * sizeof(unsigned long);
+    nat_port_bitmap = kvzalloc(bsz, GFP_KERNEL);
+    if (nat_port_bitmap == NULL) {
+        printk(KERN_ERR "xt_NAT: cannot allocate %zu bytes of port bitmaps for %u addresses\n",
+               bsz, pool_size);
+        kvfree(create_session_lock);
+        create_session_lock = NULL;
+        return -ENOMEM;
+    }
+    printk(KERN_INFO "xt_NAT DEBUG: port bitmap mem: %zu (%u addresses)\n", bsz, pool_size);
+
     return 0;
 }
 
@@ -299,6 +362,8 @@ static void pool_table_remove(void)
 {
     kvfree(create_session_lock);
     create_session_lock = NULL;
+    kvfree(nat_port_bitmap);
+    nat_port_bitmap = NULL;
 
     printk(KERN_INFO "xt_NAT pool_table_remove DEBUG: removed\n");
 }
@@ -465,21 +530,42 @@ static struct nat_session *lookup_session_out(const uint8_t proto, const u_int32
     return NULL;
 }
 
+/* Called with create_session_lock[] for this NAT address held, so nothing else
+ * sets bits in this map concurrently; the GC only ever clears them, which can
+ * at worst make us miss a port that just became free.
+ *
+ * The old version probed lookup_session_out() for up to 64512 candidate ports,
+ * each a full hash lookup, under that same spinlock with BH disabled. Average
+ * cost grew as 1/(1-occupancy) and the exhausted case was a soft-lockup
+ * generator.
+ */
 static uint16_t search_free_l4_port(const uint8_t proto, const u_int32_t nataddr, const uint16_t userport)
 {
-    uint16_t i, freeport;
-    for(i = 0; i < 64512; i++) {
-        freeport = ntohs(userport) + i;
+    unsigned long *map;
+    unsigned int start, port;
 
-        if (freeport < 1024) {
-            freeport += 1024;
-        }
+    map = nat_ports_for(nataddr, proto);
+    if (unlikely(map == NULL))
+        return userport;
 
-        if(!lookup_session_out(proto, nataddr, htons(freeport))) {
-            return htons(freeport);
-        }
-    }
-    return 0;
+    start = ntohs(userport);
+    if (start < NAT_PORT_LO)
+        start += NAT_PORT_LO;
+
+    /* port preservation: the subscriber's own source port when it is free,
+     * which is what the linear scan produced in the common case */
+    if (!test_and_set_bit(start, map))
+        return htons(start);
+
+    port = find_next_zero_bit(map, NAT_PORT_BITS, start);
+    if (port >= NAT_PORT_BITS)                  /* wrap to [1024, start) */
+        port = find_next_zero_bit(map, start, NAT_PORT_LO);
+    if (port >= NAT_PORT_BITS || port < NAT_PORT_LO)
+        return 0;
+    if (unlikely(test_and_set_bit(port, map)))
+        return 0;
+
+    return htons(port);
 }
 
 static int check_user_limits(const u_int8_t proto, const u_int32_t addr)
@@ -1339,6 +1425,7 @@ static void sessions_cleanup_timer_callback( struct timer_list *timer )
 {
     struct nat_session *sess;
     struct hlist_node *next;
+    unsigned long *map;
     unsigned int i, ohash;
     uint8_t proto;
     u_int32_t addr;
@@ -1377,6 +1464,17 @@ static void sessions_cleanup_timer_callback( struct timer_list *timer )
                     netflow_export_flow_v9(sess->proto, sess->in_addr, sess->in_port,
                                            sess->u.dst.addr, sess->u.dst.port,
                                            sess->nat_addr, sess->out_port, 2);
+
+                    /* Release the port at the same instant the session stops
+                     * being visible to lookup_session_out(), which is what the
+                     * old scan did. Moving this to the unlink branch below
+                     * would hold the port for one more sweep (~10s) - a real
+                     * quarantine, at the cost of that many ports per second of
+                     * churn being unavailable.
+                     */
+                    map = nat_ports_for(sess->nat_addr, sess->proto);
+                    if (map)
+                        clear_bit(ntohs(sess->out_port), map);
                 } else if (sess->timeout <= -10) {
                     proto = sess->proto;
                     addr  = sess->in_addr;

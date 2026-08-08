@@ -17,6 +17,9 @@
 #   ./bench-cps.sh --pool-sweep        1, 2, 4, 8, 16 NAT addresses
 #   ./bench-cps.sh --gc-cost           what the GC costs at rest, vs table size
 #   ./bench-cps.sh --netflow           with a collector attached, as deployed
+#   ./bench-cps.sh --pool 1 --duration 40
+#                                      one NAT address, long enough to exhaust
+#                                      its 64512 ports and show what happens
 #
 # READ THIS BEFORE QUOTING A NUMBER. In a VM, over veth, this measures a
 # software path on a virtual CPU. The absolute figure is meaningless as a
@@ -65,6 +68,7 @@ while [ $# -gt 0 ]; do
         --pool-sweep) SWEEP=1 ;;
         --gc-cost)    GCCOST=1 ;;
         --netflow)    NETFLOW=1 ;;
+        --pool)       shift; POOL_END=203.0.113.${1:-4} ;;
         --keep)     KEEP=1 ;;
         -h|--help)  usage ;;
         *) die "unknown option: $1" ;;
@@ -284,6 +288,27 @@ else
     printf '%-12s %10s %10s %10s %10s %10s %10s\n' \
         "----" "------" "---" "-----" "------" "------" "-------"
     run_once "$(echo "$POOL_END" | cut -d. -f4) addr"
+
+    # A full cone NAT must never map two sessions to the same
+    # (proto, nat ip, nat port): the outer table is keyed on exactly that, so a
+    # duplicate means one subscriber's return traffic reaches another. The port
+    # allocator is supposed to make this impossible, so check it rather than
+    # assume it.
+    head_ "port allocation invariant"
+    local total dups
+    total=$(awk '$1 ~ /^[0-9]+$/ && /->/ {n++} END{print n+0}' /proc/net/NAT/sessions 2>/dev/null)
+    dups=$(awk '$1 ~ /^[0-9]+$/ && /->/ {print $1, $4}' /proc/net/NAT/sessions 2>/dev/null \
+           | sort | uniq -d | wc -l)
+    say "     sessions listed:            $total"
+    say "     duplicate (proto,nat:port): $dups"
+    if [ "${dups:-0}" -gt 0 ]; then
+        say "     ${C_R}COLLISION: the same NAT port is mapped to more than one session${C_0}"
+        awk '$1 ~ /^[0-9]+$/ && /->/ {print $1, $4}' /proc/net/NAT/sessions | sort | uniq -d | head -3 \
+            | while read -r p np; do
+                say "       proto $p $np used by:"
+                awk -v p="$p" -v np="$np" '$1==p && $4==np {print "         " $0}' /proc/net/NAT/sessions | head -3
+              done
+    fi
 
     head_ "counters after the run"
     sed 's/^/     /' /proc/net/NAT/statistics 2>/dev/null
