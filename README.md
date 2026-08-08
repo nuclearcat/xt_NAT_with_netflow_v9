@@ -43,6 +43,25 @@ per user per protocol (default 4096, max 65535). It is writable at runtime via
 * No ALGs/helpers (FTP/SIP/PPTP/etc.) are implemented.
 * For non-TCP/UDP/ICMP protocols, mapping is per-user+proto (port=0), so distinct flows of the same protocol are not separated.
 
+## Migrating from xt_NAT
+
+The rename is not backward compatible. Everything user-visible changed:
+
+| was | is |
+|---|---|
+| `iptables ... -j NAT --snat` | `iptables ... -j CGNAT --snat` |
+| `/proc/net/NAT/{sessions,users,statistics}` | `/proc/net/CGNAT/...` |
+| `modprobe xt_NAT` | `modprobe xt_CGNAT` |
+| `xt_NAT.ko`, `libxt_NAT.so` | `xt_CGNAT.ko`, `libxt_CGNAT.so` |
+| `MODULE_ALIAS ipt_NAT` | `ipt_CGNAT` |
+
+So: update firewall rules, any monitoring that reads `/proc/net/NAT`, and
+modprobe/modules-load configuration. Old and new cannot be loaded side by side
+under the same rules — the target name is what changed.
+
+Module parameters kept their names, and `nat_pool` accepts the old syntax
+unchanged, so a plain `nat_pool=<start>-<end>` still means what it always did.
+
 ## Testing
 
 Functional tests, memory/locking checks under KASAN and lockdep, and the
