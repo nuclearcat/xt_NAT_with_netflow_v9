@@ -199,6 +199,8 @@ struct nat_pool_stats {
 };
 
 struct nat_pool {
+    bool used;                          /* slot occupied */
+    atomic_t refcnt;                    /* iptables rules pointing here */
     char name[XT_CGNAT_POOL_NAMELEN];
     u_int32_t start, end;               /* network order, inclusive */
     unsigned int size;                  /* addresses */
@@ -216,7 +218,17 @@ struct nat_pool {
 };
 
 static struct nat_pool nat_pools[CGNAT_MAX_POOLS];
-static int nat_npools;
+
+/* Writers only. The packet path never walks this array - a rule carries a
+ * resolved pointer and a session carries its index - so readers that do walk
+ * it (checkentry, /proc) are all in process context and can just take the
+ * mutex.
+ */
+static DEFINE_MUTEX(nat_pools_mutex);
+
+#define for_each_pool(i, p) \
+    for ((i) = 0; (i) < CGNAT_MAX_POOLS; (i)++) \
+        if (!(p = &nat_pools[i])->used) continue; else
 
 static inline unsigned long *nat_ports_for(const struct nat_pool *pool,
                                            const u_int32_t nataddr, uint8_t proto)
@@ -249,11 +261,12 @@ static s64 pool_stat_sum(const struct nat_pool *p, size_t off)
 /* summed across pools, for the global counters file */
 static s64 all_pools_stat(size_t off)
 {
+    struct nat_pool *p;
     s64 total = 0;
     int i;
 
-    for (i = 0; i < nat_npools; i++)
-        total += pool_stat_sum(&nat_pools[i], off);
+    for_each_pool(i, p)
+        total += pool_stat_sum(p, off);
     return total;
 }
 #define ALL_STAT_READ(f) all_pools_stat(offsetof(struct nat_pool_stats, f))
@@ -261,13 +274,15 @@ static s64 all_pools_stat(size_t off)
 
 static struct nat_pool *pool_by_name(const char *name)
 {
+    struct nat_pool *p;
     int i;
 
-    if (!name || !name[0])
-        return nat_npools ? &nat_pools[0] : NULL;
-    for (i = 0; i < nat_npools; i++)
-        if (!strncmp(nat_pools[i].name, name, XT_CGNAT_POOL_NAMELEN))
-            return &nat_pools[i];
+    for_each_pool(i, p) {
+        if (!name || !name[0])
+            return p;                   /* no --pool: the first one */
+        if (!strncmp(p->name, name, XT_CGNAT_POOL_NAMELEN))
+            return p;
+    }
     return NULL;
 }
 
@@ -502,13 +517,15 @@ static void pool_table_remove(struct nat_pool *pool)
 
 static int pools_create(void)
 {
+    struct nat_pool *p;
     int i, ret;
 
-    for (i = 0; i < nat_npools; i++) {
-        ret = pool_table_create(&nat_pools[i]);
+    for_each_pool(i, p) {
+        ret = pool_table_create(p);
         if (ret < 0) {
             while (--i >= 0)
-                pool_table_remove(&nat_pools[i]);
+                if (nat_pools[i].used)
+                    pool_table_remove(&nat_pools[i]);
             return ret;
         }
     }
@@ -517,10 +534,11 @@ static int pools_create(void)
 
 static void pools_remove(void)
 {
+    struct nat_pool *p;
     int i;
 
-    for (i = 0; i < nat_npools; i++)
-        pool_table_remove(&nat_pools[i]);
+    for_each_pool(i, p)
+        pool_table_remove(p);
 }
 
 static int users_htable_create(void)
@@ -1817,11 +1835,11 @@ static const struct proc_ops users_seq_fops = {
 
 static int pools_seq_show(struct seq_file *m, void *v)
 {
-    const struct nat_pool *p;
+    struct nat_pool *p;
     int i;
 
-    for (i = 0; i < nat_npools; i++) {
-        p = &nat_pools[i];
+    seq_printf(m, "# write \"add [<name>:]<start>-<end>[:<cidr>:<ports>]\" or \"del <name>\"\n");
+    for_each_pool(i, p) {
         seq_printf(m, "pool %s\n", p->name);
         seq_printf(m, "  range: %pI4-%pI4 (%u addresses, %u ports each)\n",
                    &p->start, &p->end, p->size,
@@ -1838,6 +1856,7 @@ static int pools_seq_show(struct seq_file *m, void *v)
         seq_printf(m, "  failed user limit: %lld\n",   POOL_STAT_READ(p, ulimit));
         seq_printf(m, "  failed no free port: %lld\n", POOL_STAT_READ(p, noport));
         seq_printf(m, "  failed unmapped subscriber: %lld\n", POOL_STAT_READ(p, nomap));
+        seq_printf(m, "  rules referencing: %d\n", atomic_read(&p->refcnt));
     }
     return 0;
 }
@@ -1845,11 +1864,53 @@ static int pools_seq_open(struct inode *inode, struct file *file)
 {
     return single_open(file, pools_seq_show, NULL);
 }
+
+/* defined below, next to the boot-time parser they share */
+static int pool_add(char *spec);
+static int pool_del(const char *name);
+
+/* Reconfiguring the NAT is not a read-only operation and must not be available
+ * to any local user: mode 0600 and CAP_NET_ADMIN, checked before anything is
+ * allocated so an unprivileged writer cannot even make the module allocate.
+ */
+static ssize_t pools_proc_write(struct file *file, const char __user *ubuf,
+                                size_t count, loff_t *ppos)
+{
+    char buf[160], *line, *verb, *rest;
+    int ret;
+
+    if (!capable(CAP_NET_ADMIN))
+        return -EPERM;
+    if (count == 0 || count >= sizeof(buf))
+        return -EINVAL;
+    if (copy_from_user(buf, ubuf, count))
+        return -EFAULT;
+    buf[count] = '\0';
+
+    line = strim(buf);
+    verb = strsep(&line, " \t");
+    rest = line ? strim(line) : NULL;
+    if (!verb || !rest || !*rest)
+        return -EINVAL;
+
+    mutex_lock(&nat_pools_mutex);
+    if (!strcmp(verb, "add"))
+        ret = pool_add(rest);
+    else if (!strcmp(verb, "del"))
+        ret = pool_del(rest);
+    else
+        ret = -EINVAL;
+    mutex_unlock(&nat_pools_mutex);
+
+    return ret < 0 ? ret : count;
+}
+
 static const struct proc_ops pools_seq_fops = {
     .proc_open           = pools_seq_open,
     .proc_read           = seq_read,
     .proc_lseek          = seq_lseek,
     .proc_release        = single_release,
+    .proc_write          = pools_proc_write,
 };
 
 static int stat_seq_show(struct seq_file *m, void *v)
@@ -1984,7 +2045,17 @@ static int nat_tg_check(const struct xt_tgchk_param *par)
     }
     /* resolved once here so the packet path never looks a name up */
     info->priv = pool;
+    atomic_inc(&pool->refcnt);
     return 0;
+}
+
+static void nat_tg_destroy(const struct xt_tgdtor_param *par)
+{
+    const struct xt_cgnat_tginfo *info = par->targinfo;
+    struct nat_pool *pool = info->priv;
+
+    if (pool)
+        atomic_dec(&pool->refcnt);
 }
 
 static struct xt_target nat_tg_reg __read_mostly = {
@@ -1994,6 +2065,7 @@ static struct xt_target nat_tg_reg __read_mostly = {
     .hooks    = (1 << NF_INET_FORWARD) | (1 << NF_INET_PRE_ROUTING) | (1 << NF_INET_POST_ROUTING),
     .target   = nat_tg,
     .checkentry = nat_tg_check,
+    .destroy    = nat_tg_destroy,
     .targetsize = sizeof(struct xt_cgnat_tginfo),
     .usersize   = offsetof(struct xt_cgnat_tginfo, priv),
     .me       = THIS_MODULE,
@@ -2008,7 +2080,7 @@ static struct xt_target nat_tg_reg __read_mostly = {
  * first. The old single-pool syntax still means exactly what it did - it is
  * recognised by its first field containing '-', which a name cannot.
  */
-static int __init nat_pool_parse_one(char *spec, struct nat_pool *pool)
+static int nat_pool_parse_one(char *spec, struct nat_pool *pool)
 {
     char *p = spec, *first, *range, *sub, *portstr, *sep;
     unsigned int ports, need, per_addr, prefix;
@@ -2095,10 +2167,99 @@ static int __init nat_pool_parse_one(char *spec, struct nat_pool *pool)
     return 0;
 }
 
+/* name unique and range disjoint from every other live pool. Overlap matters:
+ * an address in two pools would have two independent port bitmaps, so the
+ * second allocation would not see the first and would hand out a port already
+ * in use. */
+static int pool_conflicts(const struct nat_pool *cand)
+{
+    const struct nat_pool *p;
+    int i;
+
+    for_each_pool(i, p) {
+        if (p == cand)
+            continue;
+        if (!strncmp(p->name, cand->name, XT_CGNAT_POOL_NAMELEN)) {
+            printk(KERN_ERR "xt_CGNAT: pool '%s' already exists\n", cand->name);
+            return -EEXIST;
+        }
+        if (ntohl(cand->start) <= ntohl(p->end) && ntohl(p->start) <= ntohl(cand->end)) {
+            printk(KERN_ERR "xt_CGNAT: pool '%s' overlaps '%s'\n", cand->name, p->name);
+            return -EINVAL;
+        }
+    }
+    return 0;
+}
+
+/* Runtime add. Caller holds nat_pools_mutex. The slot is only marked used once
+ * it is fully built, and nothing can reach it before that: the packet path
+ * needs a rule, and a rule needs checkentry to find it by name. */
+static int pool_add(char *spec)
+{
+    struct nat_pool tmp = {}, *slot = NULL;
+    int i, ret;
+
+    ret = nat_pool_parse_one(spec, &tmp);
+    if (ret < 0)
+        return ret;
+    ret = pool_conflicts(&tmp);
+    if (ret < 0)
+        return ret;
+
+    for (i = 0; i < CGNAT_MAX_POOLS; i++)
+        if (!nat_pools[i].used) { slot = &nat_pools[i]; break; }
+    if (!slot) {
+        printk(KERN_ERR "xt_CGNAT: no free pool slot (max %d)\n", CGNAT_MAX_POOLS);
+        return -ENOSPC;
+    }
+
+    *slot = tmp;
+    atomic_set(&slot->refcnt, 0);
+    ret = pool_table_create(slot);
+    if (ret < 0) {
+        memset(slot, 0, sizeof(*slot));
+        return ret;
+    }
+    slot->used = true;
+    return 0;
+}
+
+/* Runtime delete. Refused while anything still points at the pool: a rule
+ * holds a resolved pointer to the slot, and every live session holds its index
+ * and dereferences it to release its port. Reusing the slot under either would
+ * be a use-after-free with extra steps. */
+static int pool_del(const char *name)
+{
+    struct nat_pool *p;
+    int i, refs;
+    s64 active;
+
+    for_each_pool(i, p) {
+        if (strncmp(p->name, name, XT_CGNAT_POOL_NAMELEN))
+            continue;
+
+        refs   = atomic_read(&p->refcnt);
+        active = POOL_STAT_READ(p, active);
+        if (refs > 0 || active > 0) {
+            printk(KERN_ERR "xt_CGNAT: pool '%s' still in use: %d rule(s), %lld session(s)\n",
+                   p->name, refs, active);
+            return -EBUSY;
+        }
+
+        pool_table_remove(p);
+        memset(p, 0, sizeof(*p));       /* clears used */
+        printk(KERN_INFO "xt_CGNAT: pool '%s' removed\n", name);
+        return 0;
+    }
+    printk(KERN_ERR "xt_CGNAT: no pool named '%s'\n", name);
+    return -ENOENT;
+}
+
 static int __init nat_pool_parse(void)
 {
     char buf[256], *p, *spec;
-    int i, ret;
+    struct nat_pool *slot;
+    int n = 0, ret;
 
     if (strscpy(buf, nat_pool, sizeof(buf)) < 0) {
         printk(KERN_ERR "xt_CGNAT: nat_pool string too long\n");
@@ -2109,36 +2270,23 @@ static int __init nat_pool_parse(void)
     while ((spec = strsep(&p, ",")) != NULL) {
         if (!*spec)
             continue;
-        if (nat_npools >= CGNAT_MAX_POOLS) {
+        if (n >= CGNAT_MAX_POOLS) {
             printk(KERN_ERR "xt_CGNAT: at most %d pools\n", CGNAT_MAX_POOLS);
             return -EINVAL;
         }
-        ret = nat_pool_parse_one(spec, &nat_pools[nat_npools]);
+        slot = &nat_pools[n];
+        ret = nat_pool_parse_one(spec, slot);
         if (ret < 0)
             return ret;
-        nat_npools++;
+        slot->used = true;              /* tables are built later by pools_create() */
+        atomic_set(&slot->refcnt, 0);
+        if (pool_conflicts(slot) < 0)
+            return -EINVAL;
+        n++;
     }
-    if (nat_npools == 0) {
+    if (n == 0) {
         printk(KERN_ERR "xt_CGNAT: nat_pool defines no pools\n");
         return -EINVAL;
-    }
-
-    /* Names must be unique or --pool is ambiguous, and ranges must not overlap
-     * or a NAT address would belong to two pools with two port bitmaps. */
-    for (i = 1; i < nat_npools; i++) {
-        int j;
-        for (j = 0; j < i; j++) {
-            if (!strncmp(nat_pools[i].name, nat_pools[j].name, XT_CGNAT_POOL_NAMELEN)) {
-                printk(KERN_ERR "xt_CGNAT: duplicate pool name '%s'\n", nat_pools[i].name);
-                return -EINVAL;
-            }
-            if (ntohl(nat_pools[i].start) <= ntohl(nat_pools[j].end) &&
-                ntohl(nat_pools[j].start) <= ntohl(nat_pools[i].end)) {
-                printk(KERN_ERR "xt_CGNAT: pools '%s' and '%s' overlap\n",
-                       nat_pools[i].name, nat_pools[j].name);
-                return -EINVAL;
-            }
-        }
     }
     return 0;
 }
@@ -2235,7 +2383,7 @@ static int __init nat_tg_init(void)
     proc_create("sessions", 0644, proc_net_nat, &nat_seq_fops);
     proc_create("users", 0644, proc_net_nat, &users_seq_fops);
     proc_create("statistics", 0644, proc_net_nat, &stat_seq_fops);
-    proc_create("pools", 0644, proc_net_nat, &pools_seq_fops);
+    proc_create("pools", 0600, proc_net_nat, &pools_seq_fops);
 
     nat_timers_setup();
 

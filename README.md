@@ -61,8 +61,23 @@ iptables -t raw -A PREROUTING -d 203.0.113.0/24 -j CGNAT --dnat --pool retail
 iptables -t raw -A PREROUTING -d 198.51.100.0/24 -j CGNAT --dnat --pool biz
 ```
 
+Pools can also be managed at runtime, without reloading the module and dropping
+every session:
+
+```
+# echo "add wholesale:198.51.100.128-198.51.100.191" > /proc/net/CGNAT/pools
+# echo "add trial:203.0.113.200-203.0.113.230:10.30.0.0/22:2016" > /proc/net/CGNAT/pools
+# echo "del trial" > /proc/net/CGNAT/pools
+# cat /proc/net/CGNAT/pools
+```
+
+Deleting is refused while anything still points at the pool - any iptables rule
+naming it, or any live session - and the error says which. Drop the rules and
+let the sessions age out first. The file is mode 0600 and the write path also
+requires `CAP_NET_ADMIN`: it reconfigures the NAT.
+
 Up to 8 pools. Names must be unique and ranges must not overlap - both are
-refused at load. Omitting `--pool` selects the first. Per-pool configuration
+refused, at load and at runtime. Omitting `--pool` selects the first. Per-pool configuration
 and counters are in `/proc/net/CGNAT/pools`; `statistics` shows the totals.
 
 Note `/proc/net/CGNAT/users` no longer prints a NAT address: with several pools

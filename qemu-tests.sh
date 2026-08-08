@@ -476,6 +476,42 @@ t_named_pools() {
     esac
 }
 
+t_pool_runtime() {
+    local n="pools can be added and removed at runtime"
+    module_loaded || { skip "$n" "module not loaded"; return; }
+    dmesg_mark
+
+    # add
+    if ! echo "add extra:203.0.113.200-203.0.113.230" > /proc/net/CGNAT/pools 2>"$TMPD/err"; then
+        fail "$n" "add failed: $(head -1 "$TMPD/err")"; return
+    fi
+    grep -q "^pool extra" /proc/net/CGNAT/pools || { fail "$n" "added pool not listed"; return; }
+
+    # overlapping range must be refused
+    if echo "add dup:203.0.113.210-203.0.113.240" > /proc/net/CGNAT/pools 2>/dev/null; then
+        fail "$n" "an overlapping pool was accepted"; return
+    fi
+    # duplicate name must be refused
+    if echo "add extra:198.51.100.200-198.51.100.230" > /proc/net/CGNAT/pools 2>/dev/null; then
+        fail "$n" "a duplicate pool name was accepted"; return
+    fi
+
+    # in use by a rule -> refused
+    ipt -I FORWARD 1 -s $SUB_CIDR -o xn-i0 -j CGNAT --snat --pool extra
+    if echo "del extra" > /proc/net/CGNAT/pools 2>/dev/null; then
+        fail "$n" "deleted a pool while a rule still referenced it"; return
+    fi
+    ipt -D FORWARD -s $SUB_CIDR -o xn-i0 -j CGNAT --snat --pool extra
+
+    # now it should go
+    if ! echo "del extra" > /proc/net/CGNAT/pools 2>"$TMPD/err"; then
+        fail "$n" "del failed with no references: $(head -1 "$TMPD/err")"; return
+    fi
+    grep -q "^pool extra" /proc/net/CGNAT/pools && { fail "$n" "pool still listed after del"; return; }
+
+    dmesg_check "$n" && pass "$n"
+}
+
 t_target_validation() {
     local n="rule without --snat/--dnat is rejected"
     dmesg_mark
@@ -708,6 +744,7 @@ t_icmp_error
 t_icmp_malformed
 t_target_validation
 t_named_pools
+t_pool_runtime
 t_capture
 t_bad_params
 t_reload_cycles
